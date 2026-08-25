@@ -260,6 +260,7 @@ GOOGLE_API_KEY=your-key        # Google Imagen images, Google TTS (700+ voices)
 
 # More video providers:
 ARK_API_KEY=your-key           # Volcengine Ark direct — Seedance 2.0 Standard/Fast/Mini
+ANYFAST_API_KEY=your-key       # AnyFast gateway — Seedance 2.5 / 2.0 / Fast / Mini / Ultra
 HEYGEN_API_KEY=your-key        # HeyGen — VEO, Sora, Runway, Kling via single gateway
 RUNWAY_API_KEY=your-key        # Runway Gen-4 direct
 ```

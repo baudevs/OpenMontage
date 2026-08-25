@@ -16,16 +16,17 @@ weights in OpenMontage.
 |-------|-----------|-------|
 | fal.ai | `seedance_video`, `model_version: "2.5"` | T2V, I2V, and reference-to-video |
 | Volcengine Ark | `seedance_ark`, `model: "2.5"` | First-party model ID `doubao-seedance-2-5-260628`; custom token price required for cost estimates |
+| AnyFast | `anyfast_video`, `model: "seedance-2.5"` | Gateway route: T2V, first/last-frame, multimodal reference, edit, extend; 480p/720p/1080p; billed per generation, so set a price override for cost estimates |
 | Runway | `runway_video`, `model: "seedance2_5"` | T2V, I2V, V2V; 480p/720p |
 | ComfyUI Partner Node | `comfyui_video`, `model_family: "seedance_2.5"` | Hosted and paid despite running in a ComfyUI graph |
 
 Do not invent a Replicate, HeyGen, or Higgsfield identifier when their current
 public API schema does not list Seedance 2.5.
 
-> **Resolution note.** The supported routes above expose 480p and 720p. The model
-> generates 1080p natively on the vendor's own web platform, which is not an
-> OpenMontage route. If a vendor blog cites 1080p or 4K, check which surface it means
-> before promising it in a pipeline.
+> **Resolution note.** fal.ai, Ark, Runway, and the ComfyUI Partner Node expose 480p and
+> 720p; AnyFast additionally documents 1080p (10-bit H.265/HEVC) for `seedance-2.5`.
+> Confirm the route before promising a resolution in a pipeline, and if a vendor blog
+> cites 1080p or 4K, check which surface it means.
 
 ## Reference limits
 

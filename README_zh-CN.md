@@ -188,6 +188,7 @@ GOOGLE_API_KEY=your-key        # Google Imagen 图像、Google TTS（700+ 种声
 
 # 更多视频提供商:
 ARK_API_KEY=your-key           # 火山方舟直连 — Seedance 2.0 Standard/Fast/Mini
+ANYFAST_API_KEY=your-key       # AnyFast 网关 — Seedance 2.5 / 2.0 / Fast / Mini / Ultra
 HEYGEN_API_KEY=your-key        # HeyGen — 汇集 VEO、Sora、Runway、Kling 的统一网关
 RUNWAY_API_KEY=your-key        # Runway Gen-4 直连
 ```

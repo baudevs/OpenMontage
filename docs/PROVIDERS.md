@@ -19,12 +19,13 @@ Everything you need to know about every provider in OpenMontage — setup instru
 | 7 | **~$0.04/image** | Google Imagen | Imagen 4 images (shares the Google API key) |
 | 8 | **pay-as-you-go** | Kling Official | Official direct Kling video, image, TTS, avatar, and lip-sync API, separate from fal.ai Kling |
 | 9 | **pay-as-you-go** | Volcengine Ark | Official direct Seedance 2.0 Standard/Fast/Mini API |
-| 10 | **$12/month** | Runway | Gen-4 video — highest quality AI video |
-| 11 | **pay-as-you-go** | Hunyuan cloud video | Chinese-friendly T2V + I2V |
-| 12 | **pay-as-you-go** | HeyGen | Avatar videos, multi-model video gateway |
-| 13 | **pay-as-you-go** | Suno | Full song generation with vocals and lyrics |
-| 14 | **$0 + GPU** | Local video gen | WAN 2.1, Hunyuan, CogVideo, LTX — free, offline |
-| 15 | **$0 + GPU** | Local Diffusion | Stable Diffusion images — free, offline |
+| 10 | **pay-as-you-go** | AnyFast | One key for the whole Seedance video family (2.5, 2.0, Fast, Mini, Ultra) |
+| 11 | **$12/month** | Runway | Gen-4 video — highest quality AI video |
+| 12 | **pay-as-you-go** | Hunyuan cloud video | Chinese-friendly T2V + I2V |
+| 13 | **pay-as-you-go** | HeyGen | Avatar videos, multi-model video gateway |
+| 14 | **pay-as-you-go** | Suno | Full song generation with vocals and lyrics |
+| 15 | **$0 + GPU** | Local video gen | WAN 2.1, Hunyuan, CogVideo, LTX — free, offline |
+| 16 | **$0 + GPU** | Local Diffusion | Stable Diffusion images — free, offline |
 
 ### Environment Variable Summary
 
@@ -55,6 +56,7 @@ AZURE_SPEECH_REGION=         # Speech resource region, e.g. eastus
 FAL_KEY=                     # FLUX, Recraft, Kling, Veo, MiniMax video
 MINIMAX_API_KEY=             # MiniMax first-party image + MiniMax H3 video generation
 ATLASCLOUD_API_KEY=          # Atlas Cloud image/video gateway
+ANYFAST_API_KEY=             # AnyFast gateway — Seedance 2.5 / 2.0 / Fast / Mini / Ultra video
 
 # KLING OFFICIAL DIRECT API
 KLING_API_KEY=               # Official Kling video, image, TTS, avatar, lip sync
@@ -101,6 +103,10 @@ Only the MiniMax H3 open-weight workflow in this table is a local model path.
 Replicate, HeyGen, and Higgsfield were not updated for these exact model
 versions because their public API documentation did not expose a current,
 stable contract for them at the time of this update.
+
+AnyFast (`anyfast_video`) is an additional single-key route to the whole
+Seedance family — `seedance-2.5`, `seedance-2.0`, `seedance-fast`,
+`seedance-2.0-mini`, and `seedance-2.0-ultra` — on one asynchronous endpoint.
 
 ---
 
@@ -250,6 +256,73 @@ Queued tasks can be cancelled with `DELETE /contents/generations/tasks/{id}`. Ta
 Ark bills Seedance by completion tokens. Rates vary by model, resolution, and whether the request includes reference video. OpenMontage estimates cost before submission and reconciles against provider-returned usage when available. Check the Ark console for current rates before a paid run; custom endpoint IDs and Seedance 2.5 require an explicit custom price so unknown pricing is never treated as free.
 
 Official references: [Seedance model list](https://www.volcengine.com/docs/82379/1366799), [create task](https://www.volcengine.com/docs/82379/1520757?lang=zh), [query task](https://www.volcengine.com/docs/82379/1521309?lang=zh).
+
+---
+
+### AnyFast — Seedance Video Gateway
+
+> **One key for the whole Seedance family.** AnyFast fronts several vendors behind a single REST contract; OpenMontage uses it for video generation across Seedance 2.5, 2.0, Fast, Mini, and Ultra — a useful alternative route when Volcengine Ark or fal.ai is unavailable in your region or account.
+
+**Tool unlocked:** `anyfast_video`
+
+**Env var:** `ANYFAST_API_KEY`
+
+#### Setup
+
+1. Create an account at [anyfast.ai](https://www.anyfast.ai) and top up credits (prepaid; video is billed **per generation**)
+2. Generate a key in the [API token console](https://www.anyfast.ai/console/token)
+3. Add the key body to `.env`: `ANYFAST_API_KEY=...`
+
+Do not include the `Bearer ` prefix in the environment value — the tool adds the authorization scheme itself and rejects a prefixed key at preflight.
+
+Optional overrides:
+
+```bash
+ANYFAST_VIDEO_MODEL=seedance-2.5          # default model when a call omits `model`
+ANYFAST_BASE_URL=https://www.anyfast.ai   # endpoint override
+ANYFAST_VIDEO_PRICE_USD=                  # flat per-generation price, for budget estimates
+ANYFAST_VIDEO_PRICE_USD_PER_SECOND=       # per-second price, for budget estimates
+```
+
+#### Models and capabilities
+
+| Model ID | Resolutions | Duration | Reference limits |
+|----------|-------------|----------|------------------|
+| `seedance-2.5` (default) | 480p, 720p, 1080p | 4–30s, or `-1`/`auto` | 30 images, 10 videos, 10 audio clips |
+| `seedance-2.0` | 480p, 720p, 1080p, 4k | 4–15s | 9 images, 3 videos, 3 audio clips |
+| `seedance-fast` | 480p, 720p | 4–15s | 9 images, 3 videos, 3 audio clips |
+| `seedance-2.0-mini` | 480p, 720p | 4–15s | 9 images, 3 videos, 3 audio clips |
+| `seedance-2.0-ultra` | 720p, 1080p, 2k (**required**) | 4–15s | 9 images, 3 videos, 3 audio clips |
+
+Seedance 2.0 Fast is published as `seedance-fast`, not `seedance-2.0-fast`; the tool accepts either plus the short aliases `2.5`, `2.0`, `standard`, `fast`, `mini`, and `ultra`. The `-nsfw` twins (`seedance-2.5-nsfw`, `seedance-2.0-nsfw`, `seedance-2.0-fast-nsfw`, `seedance-2.0-mini-nsfw`) require the Direct resource group on the AnyFast console.
+
+One creation endpoint serves five capabilities, chosen with `operation`:
+
+| `operation` | What it does | Required media |
+|-------------|--------------|----------------|
+| `text_to_video` | Prompt only, optional `web_search` | — |
+| `image_to_video` | First frame, optional last frame | one (or two) images |
+| `reference_to_video` | Multimodal reference — refer to inputs as `@image1`, `@video1`, `@audio1` | image / video / audio references |
+| `video_edit` | Edit a source clip in place | exactly one source video |
+| `video_extend` | Continue a source clip | one or more source videos |
+
+The adapter also supports synchronized native audio (`generate_audio`), `mp4`/`mov` output, `seed`, `watermark`, `return_last_frame`, `priority`, `service_tier`, `safety_identifier`, and `execution_expires_after`, plus `task_action` of `generate` (create + poll + download), `create` (submit only), or `query` (read an existing task).
+
+Frame-guided, editing, and extension tasks on Seedance 2.5 only support `ratio: adaptive`, and editing only supports automatic duration. The tool coerces those values rather than failing the run, and records what it changed in `warnings` on both `dry_run()` and the result payload.
+
+Local images and audio are encoded as validated Base64 Data URIs. **Local reference videos are rejected** — AnyFast accepts video only as a public URL or `asset://<ASSET_ID>` reference.
+
+#### API and billing notes
+
+The asynchronous flow is:
+
+`POST /v1/video/generations` → `GET /v1/video/generations/{id}` → download `result_url`.
+
+Poll while `data.status` is `NOT_START`, `QUEUED`, or `IN_PROGRESS`; read `result_url` on `SUCCESS` and `fail_reason` on `FAILURE`. Result URLs live for 24 hours (100 downloads) and task records stay queryable for 7 days, so the tool downloads outputs immediately. If a download fails after submission, the result carries the `task_id` and `recovery_action: "query"` so the paid task is never lost.
+
+AnyFast bills video **per generation** and does not publish a rate table in its API docs. Rather than fabricate a number, `estimate_cost()` returns `0.0` and every payload carries `cost_estimate_status: "unknown_gateway_pricing"` until you configure a price — set `ANYFAST_VIDEO_PRICE_USD` / `ANYFAST_VIDEO_PRICE_USD_PER_SECOND`, or pass `price_usd` / `price_usd_per_second` per call, using the rates on your console. Check the console before a batch run.
+
+Official references: [API introduction](https://docs.anyfast.ai/api-reference/introduction), [Seedance 2.5](https://docs.anyfast.ai/api-reference/model-api/bytedance/seedance-2-5), [task query](https://docs.anyfast.ai/api-reference/model-api/bytedance/seedance-task-query).
 
 ---
 
@@ -1423,6 +1496,7 @@ These tools require only FFmpeg or Python packages — no GPU, no API key.
 | **Atlas Cloud** | `ATLASCLOUD_API_KEY` | `atlas_image`, `atlas_video` | Pay-as-you-go |
 | **Kling Official** | `KLING_API_KEY` | `kling_official_video`, `kling_official_image`, `kling_tts`, `kling_avatar`, `kling_lip_sync` | Pay-as-you-go |
 | **Volcengine Ark** | `ARK_API_KEY` | `seedance_ark` | Pay-as-you-go |
+| **AnyFast** | `ANYFAST_API_KEY` | `anyfast_video` | Pay-as-you-go (billed per generation) |
 | **MiniMax direct** | `MINIMAX_API_KEY` | `minimax_image`, `minimax_video` | Pay-as-you-go |
 | **OpenAI** | `OPENAI_API_KEY` | `openai_tts`, `openai_image` | Paid only |
 | **xAI** | `XAI_API_KEY` | `grok_image`, `grok_video` | Paid only |
