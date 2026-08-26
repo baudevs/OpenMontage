@@ -533,3 +533,289 @@ class TestSelectorIntegration:
         assert tool.is_operation_available("text_to_video") is True
         assert tool.is_operation_available("video_edit") is True
         assert tool.is_operation_available("stock_video") is False
+
+class TestReferenceRules:
+    """The reference contract from the Seedance 2.5 guide."""
+
+    def test_audio_only_reference_is_legal_on_seedance_25(self):
+        payload, _ = AnyFastVideo()._build_payload(
+            {
+                "prompt": "Create a night-market performance paced to @audio1",
+                "operation": "reference_to_video",
+                "reference_audio_urls": ["https://example.com/performance.mp3"],
+            }
+        )
+        assert [item["type"] for item in payload["content"]] == ["text", "audio_url"]
+        assert payload["content"][1]["role"] == "reference_audio"
+
+    def test_audio_only_reference_is_rejected_on_the_20_family(self):
+        with pytest.raises(ValueError, match="audio-only reference"):
+            AnyFastVideo()._build_payload(
+                {
+                    "prompt": "x",
+                    "operation": "reference_to_video",
+                    "model": "seedance-2.0",
+                    "reference_audio_urls": ["https://example.com/a.mp3"],
+                }
+            )
+
+    def test_reference_to_video_still_requires_some_media(self):
+        with pytest.raises(ValueError, match="at least one reference"):
+            AnyFastVideo()._build_payload({"prompt": "x", "operation": "reference_to_video"})
+
+    def test_local_video_error_points_at_the_asset_route(self):
+        with pytest.raises(ValueError, match="auto_upload_assets"):
+            AnyFastVideo()._build_payload(
+                {
+                    "prompt": "extend this",
+                    "operation": "video_extend",
+                    "reference_video_path": "/tmp/source.mp4",
+                }
+            )
+
+    def test_direct_references_carry_the_real_person_warning(self):
+        payload, _ = AnyFastVideo()._build_payload(
+            {
+                "prompt": "orbit the subject",
+                "operation": "image_to_video",
+                "reference_image_url": "https://example.com/portrait.jpg",
+            }
+        )
+        warnings = AnyFastVideo._real_person_warnings(payload)
+        assert len(warnings) == 1
+        assert "anyfast_assets" in warnings[0]
+
+    def test_asset_references_do_not_warn(self):
+        payload, _ = AnyFastVideo()._build_payload(
+            {
+                "prompt": "orbit the subject",
+                "operation": "image_to_video",
+                "reference_image_url": "asset://asset-20260702223855-bdv2r",
+            }
+        )
+        assert AnyFastVideo._real_person_warnings(payload) == []
+
+
+class TestTimeouts:
+    def test_create_read_timeout_defaults_to_five_minutes(self):
+        tool = AnyFastVideo()
+        assert tool._create_timeout({}) == 300.0
+        assert tool._create_timeout({"create_timeout_seconds": 120}) == 120.0
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("ANYFAST_CREATE_TIMEOUT_SECONDS", "90")
+        assert AnyFastVideo()._create_timeout({}) == 90.0
+
+    def test_create_uses_connect_and_read_timeouts(self, monkeypatch):
+        monkeypatch.setenv("ANYFAST_API_KEY", "fake-anyfast-key")
+        captured = {}
+
+        def fake_post(url, *, headers, json, timeout):
+            captured["timeout"] = timeout
+            return _FakeResponse({"id": "asyntask_abc123"})
+
+        monkeypatch.setattr("requests.post", fake_post)
+        AnyFastVideo().execute(
+            {"task_action": "create", "prompt": "x", "create_timeout_seconds": 240}
+        )
+        assert captured["timeout"] == (AnyFastVideo.CONNECT_TIMEOUT_SECONDS, 240.0)
+
+    def test_create_timeout_is_never_retried_and_explains_the_risk(self, monkeypatch):
+        monkeypatch.setenv("ANYFAST_API_KEY", "fake-anyfast-key")
+        import requests
+
+        calls = {"count": 0}
+
+        def fake_post(*args, **kwargs):
+            calls["count"] += 1
+            raise requests.Timeout("read timed out")
+
+        monkeypatch.setattr("requests.post", fake_post)
+        result = AnyFastVideo().execute({"task_action": "create", "prompt": "x"})
+
+        assert result.success is False
+        assert calls["count"] == 1, "a create must never be retried — it may double-bill"
+        assert "MAY have been created" in result.error
+        assert "verify" in result.error
+
+
+class TestVerifyAction:
+    def test_verify_reports_key_acceptance_without_generating(self, monkeypatch):
+        monkeypatch.setenv("ANYFAST_API_KEY", "fake-anyfast-key")
+
+        def explode(*args, **kwargs):  # pragma: no cover - must never run
+            raise AssertionError("verify attempted a paid POST")
+
+        monkeypatch.setattr("requests.post", explode)
+        monkeypatch.setattr(
+            "requests.get",
+            lambda url, **kwargs: _FakeResponse(
+                {"data": [{"id": "seedance-2.5"}, {"id": "gpt-5"}]}
+            ),
+        )
+        result = AnyFastVideo().execute({"task_action": "verify"})
+
+        assert result.success is True
+        assert result.data["key_accepted"] is True
+        assert result.data["video_models_visible"] == ["seedance-2.5"]
+        assert result.data["endpoint"].startswith("GET https://www.anyfast.ai/v1/models")
+
+    def test_verify_surfaces_a_rejected_key(self, monkeypatch):
+        monkeypatch.setenv("ANYFAST_API_KEY", "fake-anyfast-key")
+        monkeypatch.setattr(
+            "requests.get",
+            lambda url, **kwargs: _FakeResponse(
+                {"error": {"message": "Invalid token", "type": "new_api_error"}},
+                status_code=401,
+            ),
+        )
+        result = AnyFastVideo().execute({"task_action": "verify"})
+        assert result.success is False
+        assert "Invalid token" in result.error
+
+
+class TestAutoAssetUpload:
+    def test_local_video_is_uploaded_then_referenced_as_an_asset(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ANYFAST_API_KEY", "fake-anyfast-key")
+        clip = tmp_path / "source.mp4"
+        clip.write_bytes(b"fake-mp4")
+        # A local file is hosted publicly first — AnyFast ingests assets by URL.
+        monkeypatch.setattr("tools.storage.r2_client.is_configured", lambda: True)
+        monkeypatch.setattr(
+            "tools.storage.r2_client.upload_file",
+            lambda path, **kwargs: {"key": "k", "url": "https://pub-test.r2.dev/source.mp4"},
+        )
+        monkeypatch.setattr("tools.video._anyfast.validate_asset_file", lambda *a, **k: None)
+        posts: list[str] = []
+
+        def fake_post(url, **kwargs):
+            posts.append(url)
+            if url.endswith("/CreateAssetGroup"):
+                return _FakeResponse({"Id": "group-1"})
+            if url.endswith("/CreateAsset"):
+                return _FakeResponse({"Id": "asset-1"})
+            if url.endswith("/GetAsset"):
+                return _FakeResponse({"Id": "asset-1", "Status": "Active"})
+            return _FakeResponse({"id": "asyntask_abc123"})
+
+        monkeypatch.setattr("requests.post", fake_post)
+        result = AnyFastVideo().execute(
+            {
+                "task_action": "create",
+                "operation": "video_extend",
+                "prompt": "Extend @video1 into the gallery",
+                "reference_video_path": str(clip),
+                "auto_upload_assets": True,
+            }
+        )
+
+        assert result.success is True, result.error
+        assert posts[-1].endswith("/v1/video/generations")
+        assert any("uploaded" in w for w in result.data["warnings"])
+
+    def test_dry_run_plans_the_upload_without_network(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ANYFAST_API_KEY", "fake-anyfast-key")
+        clip = tmp_path / "source.mp4"
+        clip.write_bytes(b"fake-mp4")
+
+        def explode(*args, **kwargs):  # pragma: no cover - must never run
+            raise AssertionError("dry_run attempted a network call")
+
+        monkeypatch.setattr("requests.post", explode)
+        report = AnyFastVideo().dry_run(
+            {
+                "operation": "video_extend",
+                "prompt": "Extend @video1",
+                "reference_video_path": str(clip),
+                "auto_upload_assets": True,
+            }
+        )
+        assert report["valid"] is True
+        assert any("would upload" in w for w in report["warnings"])
+        assert report["media_counts"]["video_url"] == 1
+
+    def test_upload_asset_action_returns_an_asset_reference(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ANYFAST_API_KEY", "fake-anyfast-key")
+        clip = tmp_path / "source.mp4"
+        clip.write_bytes(b"fake-mp4")
+        monkeypatch.setattr("tools.storage.r2_client.is_configured", lambda: True)
+        monkeypatch.setattr(
+            "tools.storage.r2_client.upload_file",
+            lambda path, **kwargs: {"key": "k", "url": "https://pub-test.r2.dev/source.mp4"},
+        )
+        monkeypatch.setattr("tools.video._anyfast.validate_asset_file", lambda *a, **k: None)
+
+        def fake_post(url, **kwargs):
+            if url.endswith("/CreateAssetGroup"):
+                return _FakeResponse({"Id": "group-1"})
+            if url.endswith("/CreateAsset"):
+                return _FakeResponse({"Id": "asset-1"})
+            return _FakeResponse({"Id": "asset-1", "Status": "Active"})
+
+        monkeypatch.setattr("requests.post", fake_post)
+        result = AnyFastVideo().execute(
+            {"task_action": "upload_asset", "asset_source": str(clip), "asset_type": "Video"}
+        )
+        assert result.success is True
+        assert result.data["asset_ref"] == "asset://asset-1"
+        assert result.data["status"] == "Active"
+
+
+class TestRealHumanAssetRouting:
+    """Seedance 2.5 cannot resolve a LivenessFace asset; the 2.0 family can."""
+
+    def test_catalog_flags_which_models_resolve_real_human_assets(self, monkeypatch):
+        monkeypatch.setenv("ANYFAST_API_KEY", "fake-anyfast-key")
+        catalog = AnyFastVideo().get_info()["model_catalog"]
+        assert catalog["seedance-2.5"]["resolves_real_human_assets"] is False
+        assert catalog["seedance-2.0"]["resolves_real_human_assets"] is True
+        assert catalog["seedance-2.0-ultra"]["resolves_real_human_assets"] is True
+
+    def test_asset_reference_on_25_warns_and_names_the_fix(self):
+        _, warnings = AnyFastVideo()._build_payload(
+            {
+                "operation": "reference_to_video",
+                "prompt": "@image1 smiles",
+                "reference_image_urls": ["asset://asset-20260826165210-dngrh"],
+                "model": "seedance-2.5",
+                "duration": 4,
+            }
+        )
+        assert any("seedance-2.0" in w for w in warnings)
+
+    def test_asset_reference_on_20_is_clean(self):
+        _, warnings = AnyFastVideo()._build_payload(
+            {
+                "operation": "reference_to_video",
+                "prompt": "@image1 smiles",
+                "reference_image_urls": ["asset://asset-20260826165210-dngrh"],
+                "model": "seedance-2.0",
+                "duration": 4,
+            }
+        )
+        assert warnings == []
+
+    def test_a_plain_url_on_25_does_not_warn(self):
+        _, warnings = AnyFastVideo()._build_payload(
+            {
+                "operation": "reference_to_video",
+                "prompt": "@image1 smiles",
+                "reference_image_urls": ["https://example.com/a.jpg"],
+                "model": "seedance-2.5",
+                "duration": 4,
+            }
+        )
+        assert warnings == []
+
+    def test_not_found_error_points_at_seedance_20(self):
+        hint = AnyFastVideo._reference_hint(
+            "InvalidParameter: The specified asset asset-1 is not found"
+        )
+        assert "seedance-2.0" in hint
+
+    def test_privacy_rejection_points_at_verification(self):
+        hint = AnyFastVideo._reference_hint(
+            "InputImageSensitiveContentDetected.PrivacyInformation: may contain real person"
+        )
+        assert "anyfast_assets" in hint
+

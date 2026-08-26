@@ -18,7 +18,22 @@ items and their `role`, plus `omni_reference_task_type`:
     video_edit         instruction + source video   (omni_reference_task_type=edit)
     video_extend       instruction + source video   (omni_reference_task_type=extend)
 
+Reference material sent with the request follows the documented rules exactly:
+images accept a public URL, a Base64 data URI, or `asset://<ID>`; audio the same;
+**video accepts only a URL or `asset://<ID>`** — never Base64 — so a local clip
+must go through the asset library first (`auto_upload_assets`, or the
+`anyfast_assets` tool).
+
+AnyFast's docs warn: do not send reference images or videos containing
+real-person faces unless the workflow and account are authorized. The authorized
+route is a verified LivenessFace asset group — see `anyfast_assets`.
+
+`task_action="verify"` is a free GET /v1/models probe; run it first when calls
+appear to hang, since the gateway holds the create connection open while it
+relays the task upstream (hence the 300s default create timeout).
+
 Reference: https://docs.anyfast.ai/api-reference/model-api/bytedance/seedance-2-5
+           https://docs.anyfast.ai/guides/model-api/bytedance/seedance-2-5
 """
 
 from __future__ import annotations
@@ -36,7 +51,6 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
 from tools.base_tool import (
     BaseTool,
@@ -71,6 +85,22 @@ class AnyFastVideo(BaseTool):
 
     BASE_URL = "https://www.anyfast.ai"
     CREATE_PATH = "/v1/video/generations"
+    MODELS_PATH = "/v1/models"
+    ASSET_GROUP_PATH = "/volc/asset/CreateAssetGroup"
+    ASSET_CREATE_PATH = "/volc/asset/CreateAsset"
+    ASSET_GET_PATH = "/volc/asset/GetAsset"
+    # CreateAsset routes by billing model; images are the default.
+    ASSET_MODELS = {"Image": "volc-asset", "Video": "volc-asset-video", "Audio": "volc-asset-audio"}
+    ASSET_TERMINAL_STATUSES = frozenset({"Active", "Failed"})
+
+    # Connect fast, then wait. The gateway relays the create call upstream and
+    # can hold the connection well past a minute before returning the task id,
+    # which a short read timeout turns into a "timeout on every call" report
+    # even though the request was well formed.
+    CONNECT_TIMEOUT_SECONDS = 15.0
+    DEFAULT_CREATE_TIMEOUT_SECONDS = 300.0
+    QUERY_TIMEOUT_SECONDS = 60.0
+    DOWNLOAD_TIMEOUT_SECONDS = 600.0
 
     # AnyFast model IDs exactly as the API reference spells them.  Note that
     # Seedance 2.0 Fast is published as `seedance-fast`, not `seedance-2.0-fast`.
@@ -84,6 +114,12 @@ class AnyFastVideo(BaseTool):
             "max_audios": 10,
             "max_reference_seconds": 30,
             "max_video_bytes": 200 * 1024 * 1024,
+            # Seedance 2.5 can generate from audio alone; the 2.0 family cannot.
+            "audio_only_reference": True,
+            # Seedance 2.5 cannot resolve an asset:// ID from a LivenessFace group:
+            # generation answers InvalidParameter "not found" while GetAsset reports
+            # it Active. The 2.0 family resolves the same assets. Verified 2026-08-26.
+            "liveness_assets": False,
             "adaptive_only_operations": ("image_to_video", "video_edit", "video_extend"),
         },
         "seedance-2.0": {
@@ -95,6 +131,8 @@ class AnyFastVideo(BaseTool):
             "max_audios": 3,
             "max_reference_seconds": 15,
             "max_video_bytes": 50 * 1024 * 1024,
+            "audio_only_reference": False,
+            "liveness_assets": True,
             "adaptive_only_operations": (),
         },
         "seedance-fast": {
@@ -106,6 +144,8 @@ class AnyFastVideo(BaseTool):
             "max_audios": 3,
             "max_reference_seconds": 15,
             "max_video_bytes": 50 * 1024 * 1024,
+            "audio_only_reference": False,
+            "liveness_assets": True,
             "adaptive_only_operations": (),
         },
         "seedance-2.0-mini": {
@@ -117,6 +157,8 @@ class AnyFastVideo(BaseTool):
             "max_audios": 3,
             "max_reference_seconds": 15,
             "max_video_bytes": 50 * 1024 * 1024,
+            "audio_only_reference": False,
+            "liveness_assets": True,
             "adaptive_only_operations": (),
         },
         "seedance-2.0-ultra": {
@@ -129,6 +171,8 @@ class AnyFastVideo(BaseTool):
             "max_audios": 3,
             "max_reference_seconds": 15,
             "max_video_bytes": 50 * 1024 * 1024,
+            "audio_only_reference": False,
+            "liveness_assets": True,
             "adaptive_only_operations": (),
         },
     }
@@ -188,12 +232,13 @@ class AnyFastVideo(BaseTool):
     install_instructions = (
         "Set ANYFAST_API_KEY to the API key from https://www.anyfast.ai/console/token "
         "(key body only; the tool adds the 'Bearer ' scheme).\n"
-        "  Optional: ANYFAST_BASE_URL, ANYFAST_VIDEO_MODEL.\n"
+        "  Optional: ANYFAST_BASE_URL, ANYFAST_VIDEO_MODEL, ANYFAST_CREATE_TIMEOUT_SECONDS, "
+        "ANYFAST_ASSET_GROUP_ID.\n"
         "  AnyFast bills video per generation and does not publish a rate table in its docs, "
         "so set ANYFAST_VIDEO_PRICE_USD (flat per clip) or ANYFAST_VIDEO_PRICE_USD_PER_SECOND "
         "from the console pricing page to get real budget estimates."
     )
-    agent_skills = ["seedance-2-5", "seedance-2-0", "ai-video-gen"]
+    agent_skills = ["seedance-2-5", "seedance-2-0", "anyfast-assets", "ai-video-gen"]
 
     capabilities = [
         "text_to_video",
@@ -203,6 +248,8 @@ class AnyFastVideo(BaseTool):
         "video_extend",
         "task_create",
         "task_query",
+        "task_verify",
+        "asset_upload",
     ]
     supports = {
         "text_to_video": True,
@@ -234,7 +281,8 @@ class AnyFastVideo(BaseTool):
     not_good_for = [
         "offline generation",
         "unapproved paid generation",
-        "direct local reference-video upload (URL or asset:// only)",
+        "local reference video without auto_upload_assets (URL or asset:// only)",
+        "unauthorized real-person faces sent as direct image/video references",
         "precise pre-flight budgeting without a configured price override",
     ]
     fallback_tools = ["seedance_ark", "seedance_video", "seedance_replicate", "kling_video"]
@@ -244,11 +292,14 @@ class AnyFastVideo(BaseTool):
         "properties": {
             "task_action": {
                 "type": "string",
-                "enum": ["generate", "create", "query"],
+                "enum": ["generate", "create", "query", "verify", "upload_asset"],
                 "default": "generate",
                 "description": (
                     "generate = create then poll and download; create = submit only; "
-                    "query = read an existing task."
+                    "query = read an existing task; verify = free key/reachability probe "
+                    "against GET /v1/models (run this first when calls time out); "
+                    "upload_asset = put one local file in the asset library and return its "
+                    "asset:// reference (anyfast_assets owns the full asset API)."
                 ),
             },
             "task_id": {"type": "string", "description": "Required for task_action=query."},
@@ -341,6 +392,41 @@ class AnyFastVideo(BaseTool):
             },
             "poll_interval_seconds": {"type": "number", "minimum": 0, "maximum": 60, "default": 5},
             "timeout_seconds": {"type": "number", "minimum": 1, "default": 1200},
+            "create_timeout_seconds": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "default": 300,
+                "description": (
+                    "Read timeout for the create POST. The gateway holds the connection "
+                    "while it relays the task upstream, so a short value reports a timeout "
+                    "on a well-formed request. Env: ANYFAST_CREATE_TIMEOUT_SECONDS."
+                ),
+            },
+            "auto_upload_assets": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Upload local reference media to the asset library and reference it as "
+                    "asset:// before generating. Required for a LOCAL reference video, which "
+                    "AnyFast cannot accept any other way. Billed per asset."
+                ),
+            },
+            "asset_group_id": {
+                "type": "string",
+                "description": (
+                    "Asset group for auto-uploads. For an authorized real-person portrait, "
+                    "pass the LivenessFace GroupId from anyfast_assets get_liveness_result."
+                ),
+            },
+            "asset_source": {"type": "string", "description": "task_action=upload_asset: the file/URL."},
+            "asset_type": {
+                "type": "string",
+                "enum": ["Image", "Video", "Audio"],
+                "default": "Video",
+                "description": "task_action=upload_asset: asset kind.",
+            },
+            "asset_name": {"type": "string"},
+            "asset_timeout_seconds": {"type": "number", "minimum": 1, "default": 300},
             "output_path": {"type": "string"},
         },
     }
@@ -376,6 +462,8 @@ class AnyFastVideo(BaseTool):
     user_visible_verification = [
         "Watch the downloaded clip for motion coherence and synchronized audio",
         "Confirm the local artifact before the 24-hour result URL expires",
+        "Confirm any real-person reference is authorized and came from a verified "
+        "LivenessFace asset group (see anyfast_assets)",
     ]
 
     # ---- configuration ----
@@ -405,6 +493,7 @@ class AnyFastVideo(BaseTool):
                 "max_reference_images": spec["max_images"],
                 "max_reference_videos": spec["max_videos"],
                 "max_reference_audio_clips": spec["max_audios"],
+                "resolves_real_human_assets": spec.get("liveness_assets", True),
             }
             for model, spec in self.MODELS.items()
         }
@@ -520,7 +609,9 @@ class AnyFastVideo(BaseTool):
             if action == "query":
                 self._validate_task_id(inputs.get("task_id"))
             else:
-                payload, warnings = self._build_payload(inputs)
+                planned, plan_warnings = self._resolve_media_assets(inputs, None)
+                payload, warnings = self._build_payload(planned)
+                warnings = plan_warnings + warnings + self._real_person_warnings(payload)
                 result.update(
                     {
                         "model": payload["model"],
@@ -562,12 +653,14 @@ class AnyFastVideo(BaseTool):
         estimated_cost_usd = 0.0
 
         try:
-            if action not in {"generate", "create", "query"}:
-                raise ValueError("task_action must be generate, create, or query")
+            if action not in {"generate", "create", "query", "verify", "upload_asset"}:
+                raise ValueError(
+                    "task_action must be generate, create, query, verify, or upload_asset"
+                )
             if action == "query":
                 self._validate_task_id(inputs.get("task_id"))
-            else:
-                payload, warnings = self._build_payload(inputs)
+            elif action in {"generate", "create"}:
+                create_timeout = self._create_timeout(inputs)
                 # Finish every local parse before the paid POST so a malformed
                 # price override can never create an untracked task.
                 estimated_cost_usd = self.estimate_cost(inputs)
@@ -590,6 +683,51 @@ class AnyFastVideo(BaseTool):
             )
 
         try:
+            if action == "verify":
+                probe = self._verify_access(api_key)
+                return ToolResult(
+                    success=bool(probe["key_accepted"]),
+                    data={"provider": self.provider, **probe},
+                    error=(
+                        None
+                        if probe["key_accepted"]
+                        else (
+                            f"AnyFast rejected the key (HTTP {probe['http_status']})"
+                            + (f": {probe['error']}" if probe.get("error") else "")
+                        )
+                    ),
+                    duration_seconds=round(time.time() - started, 2),
+                )
+
+            if action == "upload_asset":
+                uploaded = self._upload_asset(
+                    api_key,
+                    source=str(
+                        inputs.get("asset_source")
+                        or inputs.get("reference_video_path")
+                        or inputs.get("reference_image_path")
+                        or inputs.get("reference_audio_path")
+                        or ""
+                    ),
+                    asset_kind=str(inputs.get("asset_type", "Video")),
+                    name=str(inputs.get("asset_name", "openmontage-asset")),
+                    group_id=inputs.get("asset_group_id"),
+                    timeout=float(inputs.get("asset_timeout_seconds", 300)),
+                )
+                return ToolResult(
+                    success=True,
+                    data={"provider": self.provider, **uploaded},
+                    duration_seconds=round(time.time() - started, 2),
+                )
+
+            if action in {"generate", "create"}:
+                # Auto-upload runs before payload construction because it turns
+                # local paths into asset:// refs the payload can carry.
+                resolved, upload_warnings = self._resolve_media_assets(inputs, api_key)
+                payload, warnings = self._build_payload(resolved)
+                warnings = upload_warnings + warnings
+                warnings.extend(self._real_person_warnings(payload))
+
             if action == "query":
                 task = self._query_task(str(inputs["task_id"]), api_key)
                 return ToolResult(
@@ -605,7 +743,7 @@ class AnyFastVideo(BaseTool):
                     },
                 )
 
-            task_id = self._create_task(payload, api_key)
+            task_id = self._create_task(payload, api_key, create_timeout)
             model = str(payload["model"])
             if action == "create":
                 return ToolResult(
@@ -699,12 +837,143 @@ class AnyFastVideo(BaseTool):
                 }
             elif action == "query" and inputs.get("task_id"):
                 error_data = {"task_id": str(inputs["task_id"])}
+            message = self._safe_error(exc, api_key)
             return ToolResult(
                 success=False,
                 data=error_data,
-                error=f"AnyFast video request failed: {self._safe_error(exc, api_key)}",
+                error=(
+                    f"AnyFast video request failed: {message}"
+                    + self._reference_hint(message)
+                ),
                 duration_seconds=round(time.time() - started, 2),
             )
+
+    # ---- asset pre-pass ----
+
+    # (input key, asset kind) pairs that hold local files.
+    LOCAL_MEDIA_KEYS = (
+        ("reference_image_path", "Image"),
+        ("reference_image_paths", "Image"),
+        ("image_path", "Image"),
+        ("end_image_path", "Image"),
+        ("last_image_path", "Image"),
+        ("reference_audio_path", "Audio"),
+        ("reference_audio_paths", "Audio"),
+        ("reference_video_path", "Video"),
+        ("reference_video_paths", "Video"),
+        ("video_path", "Video"),
+    )
+
+    def _resolve_media_assets(
+        self, inputs: dict[str, Any], api_key: str | None
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Optionally upload local media to the asset library first.
+
+        Video can only be referenced by URL or `asset://` ID, so a local clip is
+        unusable without this. Images and audio can be inlined as Base64, but the
+        docs advise against that for large files. Opt in with
+        `auto_upload_assets` because CreateAsset is a billed call.
+
+        With ``api_key=None`` this plans only — local paths become placeholder
+        ``asset://`` refs so ``dry_run`` can validate the rest of the payload
+        without uploading anything.
+        """
+        if not inputs.get("auto_upload_assets"):
+            return inputs, []
+
+        from tools.video import _anyfast
+
+        resolved = dict(inputs)
+        warnings: list[str] = []
+        group_id = inputs.get("asset_group_id") or None
+        timeout = float(inputs.get("asset_timeout_seconds", 300))
+
+        for key, kind in self.LOCAL_MEDIA_KEYS:
+            value = resolved.get(key)
+            if not value:
+                continue
+            items = list(value) if isinstance(value, (list, tuple)) else [value]
+            refs: list[str] = []
+            for item in items:
+                source = str(item)
+                if _anyfast.is_remote_or_asset(source) or source.startswith("data:"):
+                    refs.append(source)
+                    continue
+                if api_key is None:
+                    refs.append(f"asset://pending-upload-{kind.lower()}")
+                    warnings.append(f"would upload {source} to the asset library as {kind}")
+                    continue
+                uploaded = _anyfast.upload_asset(
+                    api_key,
+                    source=source,
+                    asset_kind=kind,
+                    name=Path(source).name or f"openmontage-{kind.lower()}",
+                    group_id=group_id,
+                    timeout=timeout,
+                )
+                group_id = group_id or uploaded["group_id"]
+                refs.append(uploaded["asset_ref"])
+                warnings.append(
+                    f"uploaded {source} to the AnyFast asset library as "
+                    f"{uploaded['asset_ref']} ({kind})"
+                )
+            if kind == "Video":
+                # Video path keys are rejected downstream by design; carry the
+                # uploaded refs on the URL-style key instead.
+                resolved.pop(key, None)
+                existing = list(resolved.get("reference_video_urls") or [])
+                resolved["reference_video_urls"] = existing + refs
+            else:
+                resolved[key] = refs if isinstance(value, (list, tuple)) else refs[0]
+
+        if group_id and not resolved.get("asset_group_id"):
+            resolved["asset_group_id"] = group_id
+        return resolved, warnings
+
+    @staticmethod
+    def _real_person_warnings(payload: dict[str, Any]) -> list[str]:
+        """Flag direct (non-asset) image/video references.
+
+        AnyFast's docs are explicit: do not upload reference images or videos
+        containing real-person faces unless the workflow and account are
+        authorized. The authorized route is a verified LivenessFace asset group
+        (`anyfast_assets`), referenced as `asset://<id>`.
+        """
+        direct = [
+            item
+            for item in payload.get("content", [])
+            if item.get("type") in ("image_url", "video_url")
+            and not str(
+                (item.get("image_url") or item.get("video_url") or {}).get("url", "")
+            ).startswith("asset://")
+        ]
+        if not direct:
+            return []
+        return [
+            f"{len(direct)} image/video reference(s) are sent directly rather than as "
+            "asset:// IDs. Do NOT send real-person faces this way unless your workflow "
+            "and account are authorized: run anyfast_assets "
+            "(create_liveness_session -> get_liveness_result -> upload) and pass the "
+            "verified asset:// reference instead."
+        ]
+
+    @staticmethod
+    def _reference_hint(message: str) -> str:
+        """Explain the two reference failures that look like bad input but are not."""
+        if "is not found" in message and "asset" in message:
+            return (
+                "\n  An asset:// reference that GetAsset reports as Active but generation "
+                "cannot find is the Seedance 2.5 real-human gap: 2.5 does not resolve "
+                "assets from a LivenessFace group, while the 2.0 family does. Retry with "
+                "model=seedance-2.0. See the anyfast-assets skill."
+            )
+        if "PrivacyInformation" in message or "may contain real person" in message:
+            return (
+                "\n  A real person cannot be passed as a plain URL — that is exactly what "
+                "the verified real-human asset flow exists for. Run anyfast_assets "
+                "verification and reference the resulting asset:// ID."
+            )
+        return ""
 
     # ---- payload construction ----
 
@@ -774,6 +1043,23 @@ class AnyFastVideo(BaseTool):
                 )
             payload["omni_reference_task_type"] = omni
 
+        if not spec.get("liveness_assets", True):
+            asset_refs = [
+                item
+                for item in content
+                if str(
+                    (item.get("image_url") or item.get("video_url") or item.get("audio_url") or {})
+                    .get("url", "")
+                ).startswith("asset://")
+            ]
+            if asset_refs:
+                warnings.append(
+                    f"{model} cannot resolve asset:// IDs from a real-human (LivenessFace) "
+                    "group — generation reports them as not found even when GetAsset says "
+                    "Active. Use seedance-2.0 for a verified-face reference; AIGC assets "
+                    "work on either model."
+                )
+
         if inputs.get("web_search"):
             if operation != "text_to_video" or len(content) != 1:
                 raise ValueError("web_search is supported only for pure text-to-video requests")
@@ -799,8 +1085,10 @@ class AnyFastVideo(BaseTool):
 
         if inputs.get("reference_video_path") or inputs.get("video_path"):
             raise ValueError(
-                "AnyFast accepts video only as a public URL or asset:// ID; upload the "
-                "local file first (Base64 video is not supported)"
+                "AnyFast accepts video only as a public URL or asset:// ID (Base64 video "
+                "is not supported). Set auto_upload_assets=true to upload it to the asset "
+                "library first, or upload it yourself with the anyfast_assets tool and "
+                "pass the asset:// reference"
             )
 
         if operation == "text_to_video":
@@ -842,10 +1130,17 @@ class AnyFastVideo(BaseTool):
             raise ValueError(f"at most {spec['max_videos']} reference videos are supported")
         if len(audios) > spec["max_audios"]:
             raise ValueError(f"at most {spec['max_audios']} reference audio clips are supported")
-        if operation == "reference_to_video" and not (images or videos):
-            raise ValueError("reference_to_video requires at least one reference image or video")
-        if audios and not (images or videos):
-            raise ValueError("reference audio requires at least one reference image or video")
+        audio_only_ok = bool(spec.get("audio_only_reference"))
+        if operation == "reference_to_video" and not (images or videos or audios):
+            raise ValueError(
+                "reference_to_video requires at least one reference image, video, or audio clip"
+            )
+        if audios and not (images or videos) and not audio_only_ok:
+            # Seedance 2.5 generates from audio alone; the 2.0 family does not.
+            raise ValueError(
+                "this model requires at least one reference image or video alongside "
+                "reference audio; use seedance-2.5 for audio-only reference"
+            )
 
         self._validate_remote_refs(videos, "reference video")
         self._validate_reference_durations(
@@ -1226,15 +1521,41 @@ class AnyFastVideo(BaseTool):
     def _headers(api_key: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    def _create_task(self, payload: dict[str, Any], api_key: str) -> str:
+    def _create_timeout(self, inputs: dict[str, Any]) -> float:
+        raw = inputs.get("create_timeout_seconds")
+        if raw is None:
+            raw = os.environ.get("ANYFAST_CREATE_TIMEOUT_SECONDS")
+        if raw in (None, ""):
+            return self.DEFAULT_CREATE_TIMEOUT_SECONDS
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("create_timeout_seconds must be a number greater than 0") from exc
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("create_timeout_seconds must be a number greater than 0")
+        return value
+
+    def _create_task(self, payload: dict[str, Any], api_key: str, read_timeout: float) -> str:
         import requests
 
-        response = requests.post(
-            f"{self._get_base_url()}{self.CREATE_PATH}",
-            headers=self._headers(api_key),
-            json=payload,
-            timeout=60,
-        )
+        try:
+            response = requests.post(
+                f"{self._get_base_url()}{self.CREATE_PATH}",
+                headers=self._headers(api_key),
+                json=payload,
+                timeout=(self.CONNECT_TIMEOUT_SECONDS, read_timeout),
+            )
+        except requests.Timeout as exc:
+            # Never retry a create: the gateway may have accepted the task, and
+            # AnyFast exposes no "list tasks" endpoint to reconcile a duplicate.
+            raise RuntimeError(
+                f"AnyFast did not answer the create request within {read_timeout:.0f}s. "
+                "The gateway holds the connection while it relays the task upstream, so a "
+                "paid task MAY have been created — check the AnyFast console before "
+                "resubmitting. Raise create_timeout_seconds (or "
+                "ANYFAST_CREATE_TIMEOUT_SECONDS) if this recurs, and run "
+                'task_action="verify" to confirm the key and reachability.'
+            ) from exc
         self._raise_for_status(response)
         data = response.json()
         if not isinstance(data, dict):
@@ -1243,6 +1564,39 @@ class AnyFastVideo(BaseTool):
         self._validate_task_id(task_id)
         return str(task_id)
 
+    # ---- asset library (delegated to tools/video/_anyfast.py) ----
+
+    def _upload_asset(
+        self,
+        api_key: str,
+        *,
+        source: str,
+        asset_kind: str,
+        name: str,
+        group_id: str | None,
+        timeout: float,
+    ) -> dict[str, Any]:
+        from tools.video import _anyfast
+
+        return _anyfast.upload_asset(
+            api_key,
+            source=source,
+            asset_kind=asset_kind,
+            name=name,
+            group_id=group_id,
+            timeout=timeout,
+        )
+
+    def _verify_access(self, api_key: str) -> dict[str, Any]:
+        """Free reachability + credential probe against GET /v1/models."""
+        from tools.video import _anyfast
+
+        known = sorted(set(self.MODELS) | set(self.NSFW_MODELS))
+        probe = _anyfast.verify_access(api_key, known)
+        probe["video_models_visible"] = probe.pop("expected_models_visible", [])
+        return probe
+
+
     def _query_task(self, task_id: str, api_key: str) -> dict[str, Any]:
         import requests
 
@@ -1250,7 +1604,11 @@ class AnyFastVideo(BaseTool):
         response = None
         for attempt in range(self.retry_policy.max_retries + 1):
             try:
-                response = requests.get(url, headers=self._headers(api_key), timeout=30)
+                response = requests.get(
+                    url,
+                    headers=self._headers(api_key),
+                    timeout=(self.CONNECT_TIMEOUT_SECONDS, self.QUERY_TIMEOUT_SECONDS),
+                )
                 retryable = response.status_code == 429 or response.status_code >= 500
                 if retryable and attempt < self.retry_policy.max_retries:
                     time.sleep(self.retry_policy.backoff_seconds * (2**attempt))
@@ -1315,7 +1673,10 @@ class AnyFastVideo(BaseTool):
     def _download_video(video_url: str, output_path: Path) -> None:
         import requests
 
-        response = requests.get(video_url, timeout=300)
+        response = requests.get(
+            video_url,
+            timeout=(AnyFastVideo.CONNECT_TIMEOUT_SECONDS, AnyFastVideo.DOWNLOAD_TIMEOUT_SECONDS),
+        )
         response.raise_for_status()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         partial = output_path.with_name(output_path.name + ".part")
@@ -1349,45 +1710,6 @@ class AnyFastVideo(BaseTool):
 
     def _safe_error(self, exc: Exception, api_key: str | None = None) -> str:
         """Strip credentials, signed URLs, and Base64 blobs out of error text."""
-        message = str(exc)
-        for secret in {value for value in (api_key, self._get_api_key()) if value}:
-            message = message.replace(secret, "[redacted]")
-        message = re.sub(
-            r"data:(?:image|audio)/[^;\s]+;base64,[A-Za-z0-9+/=]+",
-            "[redacted data URI]",
-            message,
-            flags=re.IGNORECASE,
-        )
+        from tools.video import _anyfast
 
-        def redact_url(match: re.Match[str]) -> str:
-            raw = match.group(0)
-            trailing = ""
-            while raw and raw[-1] in ".,;:)]}":
-                trailing = raw[-1] + trailing
-                raw = raw[:-1]
-            try:
-                parsed = urlsplit(raw)
-                host = parsed.hostname or ""
-                if parsed.port:
-                    host = f"{host}:{parsed.port}"
-                return (
-                    urlunsplit(
-                        (
-                            parsed.scheme,
-                            host,
-                            parsed.path,
-                            "[redacted]" if parsed.query else "",
-                            "",
-                        )
-                    )
-                    + trailing
-                )
-            except ValueError:
-                return "[redacted URL]"
-
-        message = re.sub(r"https?://[^\s'\"<>]+", redact_url, message, flags=re.IGNORECASE)
-        return re.sub(
-            r"(?i)authorization\s*[:=]\s*bearer\s+\S+",
-            "Authorization: Bearer [redacted]",
-            message,
-        )
+        return _anyfast.safe_error(exc, api_key)

@@ -58,6 +58,13 @@ MINIMAX_API_KEY=             # MiniMax first-party image + MiniMax H3 video gene
 ATLASCLOUD_API_KEY=          # Atlas Cloud image/video gateway
 ANYFAST_API_KEY=             # AnyFast gateway — Seedance 2.5 / 2.0 / Fast / Mini / Ultra video
 
+# PUBLIC MEDIA HOSTING (required for AnyFast assets and any provider that only ingests URLs)
+R2_ACCOUNT_ID=               # Cloudflare R2 — see the R2 section below
+R2_ACCESS_KEY_ID=
+R2_SECRET_ACCESS_KEY=
+R2_BUCKET=
+R2_PUBLIC_BASE_URL=          # https://pub-<hash>.r2.dev
+
 # KLING OFFICIAL DIRECT API
 KLING_API_KEY=               # Official Kling video, image, TTS, avatar, lip sync
 KLING_API_BASE_URL=          # Optional; default https://api-singapore.klingai.com
@@ -263,7 +270,7 @@ Official references: [Seedance model list](https://www.volcengine.com/docs/82379
 
 > **One key for the whole Seedance family.** AnyFast fronts several vendors behind a single REST contract; OpenMontage uses it for video generation across Seedance 2.5, 2.0, Fast, Mini, and Ultra — a useful alternative route when Volcengine Ark or fal.ai is unavailable in your region or account.
 
-**Tool unlocked:** `anyfast_video`
+**Tools unlocked:** `anyfast_video` (generation), `anyfast_assets` (the `asset://` library + real-human verification)
 
 **Env var:** `ANYFAST_API_KEY`
 
@@ -310,7 +317,81 @@ The adapter also supports synchronized native audio (`generate_audio`), `mp4`/`m
 
 Frame-guided, editing, and extension tasks on Seedance 2.5 only support `ratio: adaptive`, and editing only supports automatic duration. The tool coerces those values rather than failing the run, and records what it changed in `warnings` on both `dry_run()` and the result payload.
 
-Local images and audio are encoded as validated Base64 Data URIs. **Local reference videos are rejected** — AnyFast accepts video only as a public URL or `asset://<ASSET_ID>` reference.
+#### How references must be sent
+
+| Media | Accepted inputs | Per-item limits (Seedance 2.5) |
+|-------|-----------------|-------------------------------|
+| Image | public URL, Base64 data URI, `asset://<ID>` | JPEG/PNG/WebP/BMP/TIFF/GIF/HEIC/HEIF, 300–6000 px per side, ratio 0.4–2.5, < 30 MB |
+| Video | **public URL or `asset://<ID>` only — never Base64** | MP4/MOV, H.264 or H.265, 480p/720p, 24–60 FPS, 2–30 s, ≤ 200 MB |
+| Audio | public URL, Base64 data URI, `asset://<ID>` | WAV/MP3, 2–30 s, ≤ 15 MB |
+
+The whole request body must stay under 64 MB, so large media belongs in the asset library rather than inline Base64. Local images and audio are encoded as validated data URIs automatically. A **local video** has no inline form: pass `auto_upload_assets: true` (the tool uploads it and references `asset://`), or upload it yourself with `anyfast_assets`.
+
+Seedance 2.5 also accepts an **audio-only** reference — no image or video required. The 2.0 family still needs at least one image or video alongside reference audio.
+
+#### Real people need authorization
+
+> AnyFast's docs are explicit: **do not upload reference images or videos containing real-person faces unless your workflow and account are authorized to use that material.**
+
+The authorized route is a verified real-human (`LivenessFace`) asset group, handled by `anyfast_assets`:
+
+```
+create_liveness_session (callback_url REQUIRED) -> H5Link + BytedToken
+   (the person opens H5Link on a phone and completes verification)
+get_liveness_result (byted_token)               -> GroupId of a LivenessFace group
+upload (group_id, group_type=LivenessFace)      -> asset://<id>, face-matched
+anyfast_video                                   -> pass the asset:// reference
+```
+
+Use the **same API token for every step** — see the notes below.
+
+Verification requires an API token created with the **Byteplus-Direct** group; an AIGC-only token returns `GroupType must be one of [AIGC]`. Uploading a different person into a verified group returns `FaceMismatch` and the asset ends as `Failed`. `anyfast_video` adds a warning to every result whose image/video references are sent directly rather than as `asset://` IDs.
+
+**Five things the published docs get wrong or leave out** — all verified against the live API on 2026-08-26:
+
+1. **`CallbackURL` is mandatory, and it is a redirect target — not just a webhook.** The schema marks the request body optional, but an empty body is rejected with `[***.CallbackURL] The required parameter CallbackURL is missing.` More importantly, the H5 page sends the person's browser to that URL when they tap **Complete**, and the group is only created once that happens. A session where the person scanned their face but never reached the redirect stays at `GroupId: ""` forever while `GetVisualValidateResult` still returns `200`. Use a URL that loads in a browser, and treat "did you land on the callback page?" as the completion check.
+2. **A LivenessFace group is invisible to `ListAssetGroups`** — under every filter, including its exact `Id`. Only `GetVisualValidateResult` reports it, so **keep the `BytedToken` and `GroupId`**; there is no way to enumerate them later. Any ownership preflight built on the listing will wrongly reject real-human uploads; `CreateAsset` is the real ownership check and rejects a foreign group with `[NotFound.group_id]` before anything is billed.
+3. **Ingest from a URL, not from a file.** AnyFast's documented multipart upload returns an asset Id and then those assets never resolve — `GetAsset` answers `[NotFound.asset_id]` indefinitely. The *identical files* registered by passing a public URL in the `URL` field reach `Active` within seconds. So a local file must be hosted first: `anyfast_assets` publishes it to Cloudflare R2 (see `r2_storage`) and registers the public URL. Multipart is still reachable via `allow_multipart: true`, but it should not be used.
+   A persistent `[NotFound.asset_id]` after a successful create therefore means the asset did not survive preprocessing, in this order: **face consistency verification failed** (the account log shows `502 upstream asset error: Face consistency verification failed` just before the 404s, and AnyFast emails it), a **duplicate `Name`** inside the group (reported as a 404 as though the group were missing — names get a unique suffix by default), or the **wrong token**. `ListAssets` does not list real-human assets, so `GetAsset` by Id is the read that works; it returns a fresh 12-hour signed URL each call, which is for inspection only — always reference `asset://<ID>` in generations.
+4. **Reference video is bounded by pixels per frame, not by a named resolution.** The limit is 407,696–8,295,044 pixels; a 406×720 portrait crop is nominally "720p" but only 292k pixels and is rejected with `[***.PixelCountTooSmall]`. Rescale to something like 720×1280 (921,600).
+5. **One token owns everything.** The token that created the verification session must also create the group's assets and read them. A stale read loop against another token's asset just fills the account log with 404s, so `anyfast_assets` stops on a persistent not-found instead of retrying for the full timeout.
+
+**Real-human upload limits are tighter than the Seedance 2.5 input limits** — the tool validates against these before uploading, since an oversized file is accepted by `CreateAsset` and only fails later as `Status: Failed`:
+
+| Asset | Real-human (LivenessFace) | Generic (AIGC) |
+|-------|---------------------------|----------------|
+| Image | JPEG/PNG/WebP/GIF/HEIC, < 30 MB, 300–6000 px, ratio 0.4–2.5 | same, plus BMP/TIFF |
+| Video | MP4/MOV, ≤ 50 MB, **2–15 s**, 24–60 FPS, 480p/720p | ≤ 200 MB, 2–30 s |
+| Audio | WAV/MP3, ≤ 15 MB, **2–15 s** | ≤ 15 MB, 2–30 s |
+
+#### Using an asset in a generation
+
+Reference it as a content item — `{"type": "image_url", "image_url": {"url": "asset://<ID>"}, "role": "reference_image"}`. Through `anyfast_video`, pass `asset://<ID>` anywhere a reference URL is accepted.
+
+**Which model reads a verified face** (tested 2026-08-26):
+
+| Model | AIGC `asset://` | LivenessFace `asset://` |
+|-------|-----------------|-------------------------|
+| `seedance-2.5`, `seedance-2.5-nsfw` | works | `InvalidParameter: ... is not found` |
+| `seedance-2.0`, `seedance-2.0-nsfw`, Fast / Mini / Ultra | works | works |
+
+Seedance 2.5 does not resolve real-human assets, in either the `reference_image` or `first_frame` role, even though `GetAsset` reports them `Active`; the 2.0 family resolves the same asset IDs. **A real person's face therefore means Seedance 2.0.** Passing that face as a plain public URL instead is refused with `InputImageSensitiveContentDetected.PrivacyInformation`, so the verified asset is the only route. `anyfast_video` raises a `dry_run` warning when an `asset://` reference is paired with a 2.5 model, and `model_catalog[model]["resolves_real_human_assets"]` exposes the flag.
+
+#### `anyfast_assets` — the asset library
+
+One tool covers every documented `/volc/asset` endpoint:
+
+| Operation | Endpoint | Notes |
+|-----------|----------|-------|
+| `upload` | R2 (local files) + CreateAssetGroup + CreateAsset + GetAsset | Validates the file, hosts it publicly if it is local, gives the Name a unique suffix, polls to `Active`; returns `asset://<id>` |
+| `create_asset` | CreateAsset | Needs an existing `group_id`; returns immediately in `Processing` |
+| `get_asset` | GetAsset, falling back to ListAssets | Free read; reports `usable` and `error_code`. Pass `group_id` (+ `group_type`) for a LivenessFace asset |
+| `update_asset` / `delete_asset` | UpdateAsset / DeleteAsset | Rename or move between groups; delete needs `confirm: true` |
+| `list_assets` / `list_groups` | ListAssets / ListAssetGroups | Filter by name, `GroupIds`, or `GroupType` |
+| `create_group` / `update_group` / `delete_group` | CreateAssetGroup / UpdateAssetGroup / DeleteAssetGroup | Delete needs `confirm: true` |
+| `create_liveness_session` / `get_liveness_result` | CreateVisualValidateSession / GetVisualValidateResult | Real-human verification |
+
+Local files upload as multipart; URLs and data URIs are sent as JSON. `CreateAsset` is asynchronous — an asset is only usable once `Status` is `Active` (typically 6–9 s for images, 9–12 s for video, 3–6 s for audio, longer when the review queue is busy).
 
 #### API and billing notes
 
@@ -318,11 +399,50 @@ The asynchronous flow is:
 
 `POST /v1/video/generations` → `GET /v1/video/generations/{id}` → download `result_url`.
 
+**If every call appears to time out**, run `anyfast_video` with `task_action: "verify"` first — a free `GET /v1/models` probe that reports whether the key is accepted, how fast the gateway answered, and whether the Seedance models are visible to your account. The gateway holds the create connection open while it relays the task upstream, so the create read timeout defaults to **300 s** (`create_timeout_seconds`, or `ANYFAST_CREATE_TIMEOUT_SECONDS`); a 60-second client timeout reports a failure on a perfectly well-formed request. A create is **never** retried automatically — the task may already have been accepted and there is no list-tasks endpoint to reconcile a duplicate — so a timeout returns an explicit "this MAY have been created, check the console" error.
+
 Poll while `data.status` is `NOT_START`, `QUEUED`, or `IN_PROGRESS`; read `result_url` on `SUCCESS` and `fail_reason` on `FAILURE`. Result URLs live for 24 hours (100 downloads) and task records stay queryable for 7 days, so the tool downloads outputs immediately. If a download fails after submission, the result carries the `task_id` and `recovery_action: "query"` so the paid task is never lost.
 
 AnyFast bills video **per generation** and does not publish a rate table in its API docs. Rather than fabricate a number, `estimate_cost()` returns `0.0` and every payload carries `cost_estimate_status: "unknown_gateway_pricing"` until you configure a price — set `ANYFAST_VIDEO_PRICE_USD` / `ANYFAST_VIDEO_PRICE_USD_PER_SECOND`, or pass `price_usd` / `price_usd_per_second` per call, using the rates on your console. Check the console before a batch run.
 
-Official references: [API introduction](https://docs.anyfast.ai/api-reference/introduction), [Seedance 2.5](https://docs.anyfast.ai/api-reference/model-api/bytedance/seedance-2-5), [task query](https://docs.anyfast.ai/api-reference/model-api/bytedance/seedance-task-query).
+Official references: [API introduction](https://docs.anyfast.ai/api-reference/introduction), [Seedance 2.5 guide](https://docs.anyfast.ai/guides/model-api/bytedance/seedance-2-5), [Seedance 2.5 reference](https://docs.anyfast.ai/api-reference/model-api/bytedance/seedance-2-5), [task query](https://docs.anyfast.ai/api-reference/model-api/bytedance/seedance-task-query), [asset management](https://docs.anyfast.ai/guides/model-api/bytedance/volc-asset), [real-human asset verification](https://docs.anyfast.ai/guides/model-api/bytedance/volc-real-human-assets).
+
+---
+
+### Cloudflare R2 — Public Media Hosting
+
+> **Not a media provider — the plumbing that lets other providers read your files.** Several APIs will only ingest a URL they can download themselves. AnyFast's asset library is the strict case: video is accepted only as a URL or `asset://` ID, and its multipart upload produces assets that never become usable.
+
+**Tool unlocked:** `r2_storage`
+
+**Env vars:** `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_PUBLIC_BASE_URL`
+
+#### Setup
+
+1. Cloudflare dashboard → **R2** → create a bucket
+2. Bucket → **Settings** → enable the **Public Development URL** → gives `https://pub-<hash>.r2.dev`
+3. R2 → **Manage API tokens** → create a token with **Object Read & Write**
+4. Add all five values to `.env`. `r2_storage` stays UNAVAILABLE until every one is set.
+
+Optional: `R2_KEY_PREFIX` (default `openmontage`), `R2_ENDPOINT`.
+
+No SDK is required — the tool signs S3 requests (SigV4) directly, so nothing new to install.
+
+#### Use
+
+| Operation | What it does |
+|-----------|--------------|
+| `upload` / `upload_many` | PUT the file(s), verify the public URL with a HEAD, return `{key, url}` |
+| `exists` / `url` | Check or rebuild the public URL for a key |
+| `delete` | Remove an object permanently |
+
+Keys are `<prefix>/<folder>/<name>-<random>.<ext>`. **Uniqueness is on by default** — overwriting a key a provider already fetched silently changes what it ingested, and AnyFast rejects a second asset that reuses a name.
+
+`upload` HEADs the public URL after writing and fails loudly if it is not readable; without that check, a bucket whose public URL is off surfaces much later as an opaque provider-side download error.
+
+#### Privacy
+
+Everything uploaded is **world-readable by anyone with the URL** — that is the point, since the provider downloads anonymously. Treat the bucket as staging, get consent before publishing a person's likeness, and `delete` once the generation is done.
 
 ---
 
@@ -1496,7 +1616,8 @@ These tools require only FFmpeg or Python packages — no GPU, no API key.
 | **Atlas Cloud** | `ATLASCLOUD_API_KEY` | `atlas_image`, `atlas_video` | Pay-as-you-go |
 | **Kling Official** | `KLING_API_KEY` | `kling_official_video`, `kling_official_image`, `kling_tts`, `kling_avatar`, `kling_lip_sync` | Pay-as-you-go |
 | **Volcengine Ark** | `ARK_API_KEY` | `seedance_ark` | Pay-as-you-go |
-| **AnyFast** | `ANYFAST_API_KEY` | `anyfast_video` | Pay-as-you-go (billed per generation) |
+| **AnyFast** | `ANYFAST_API_KEY` | `anyfast_video`, `anyfast_assets` | Pay-as-you-go (billed per generation) |
+| **Cloudflare R2** | `R2_ACCOUNT_ID` + `R2_ACCESS_KEY_ID` + `R2_SECRET_ACCESS_KEY` + `R2_BUCKET` + `R2_PUBLIC_BASE_URL` | `r2_storage` | Storage only, no egress fees |
 | **MiniMax direct** | `MINIMAX_API_KEY` | `minimax_image`, `minimax_video` | Pay-as-you-go |
 | **OpenAI** | `OPENAI_API_KEY` | `openai_tts`, `openai_image` | Paid only |
 | **xAI** | `XAI_API_KEY` | `grok_image`, `grok_video` | Paid only |

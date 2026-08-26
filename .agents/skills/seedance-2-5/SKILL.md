@@ -16,7 +16,7 @@ weights in OpenMontage.
 |-------|-----------|-------|
 | fal.ai | `seedance_video`, `model_version: "2.5"` | T2V, I2V, and reference-to-video |
 | Volcengine Ark | `seedance_ark`, `model: "2.5"` | First-party model ID `doubao-seedance-2-5-260628`; custom token price required for cost estimates |
-| AnyFast | `anyfast_video`, `model: "seedance-2.5"` | Gateway route: T2V, first/last-frame, multimodal reference, edit, extend; 480p/720p/1080p; billed per generation, so set a price override for cost estimates |
+| AnyFast | `anyfast_video`, `model: "seedance-2.5"` | Gateway route: T2V, first/last-frame, multimodal reference, edit, extend; 480p/720p/1080p; audio-only reference supported; billed per generation, so set a price override for cost estimates. Local video and authorized real-person portraits go through `anyfast_assets` as `asset://` refs |
 | Runway | `runway_video`, `model: "seedance2_5"` | T2V, I2V, V2V; 480p/720p |
 | ComfyUI Partner Node | `comfyui_video`, `model_family: "seedance_2.5"` | Hosted and paid despite running in a ComfyUI graph |
 
@@ -39,8 +39,28 @@ public API schema does not list Seedance 2.5.
 
 Reference inputs are provider-specific. fal.ai uses `image_urls`, `video_urls`,
 and `audio_urls` internally. Runway uses `references`, `referenceVideos`, and
-`referenceAudio`. Ark uses typed content entries with roles. Always call the
-OpenMontage tool instead of constructing a provider payload manually.
+`referenceAudio`. Ark and AnyFast use typed content entries with roles
+(`reference_image` / `reference_video` / `reference_audio`, or `first_frame` /
+`last_frame`). Always call the OpenMontage tool instead of constructing a
+provider payload manually.
+
+On AnyFast, video references accept only a public URL or an `asset://<ID>` —
+never Base64 — so a local clip must be uploaded with `anyfast_assets` first.
+Reference video is bounded by pixels per frame (407,696–8,295,044), not by a
+resolution name: a 406x720 crop is rejected as `PixelCountTooSmall`.
+
+**Real-person faces must not be sent as direct references** unless the workflow
+and account are authorized; use `anyfast_assets` to run liveness verification and
+pass the resulting face-matched `asset://` reference. Three gotchas verified
+against the live API:
+
+- `create_liveness_session` needs a `callback_url`, and the H5 page redirects the
+  person there on Complete — the group is only created once they land on it.
+- The resulting LivenessFace group never appears in `ListAssetGroups`. Keep the
+  `GroupId` from `get_liveness_result`; it cannot be enumerated later.
+- Assets in that group cannot be read back (`GetAsset` 404s, `ListAssets` is
+  empty), so their `Active` / `FaceMismatch` status is unknowable before use.
+  `anyfast_assets` returns the `asset://` ref with `status_verified: false`.
 
 **50 assets is a ceiling to use deliberately, not to max out.** A cluttered reference
 set with competing faces, props, and locations produces a *less* coherent result than a

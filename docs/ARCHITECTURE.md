@@ -396,7 +396,7 @@ All config is validated via Pydantic models in `lib/config_model.py`.
 | `GOOGLE_API_KEY` | google_imagen, google_tts | Google Imagen images, Google Cloud TTS |
 | `RUNWAY_API_KEY` | runway_video | Runway Gen-3/Gen-4 direct |
 | `HIGGSFIELD_API_KEY` + `HIGGSFIELD_API_SECRET` | higgsfield_video | Higgsfield multi-model video |
-| `ANYFAST_API_KEY` | anyfast_video | AnyFast gateway — Seedance 2.5 / 2.0 / Fast / Mini / Ultra video |
+| `ANYFAST_API_KEY` | anyfast_video, anyfast_assets | AnyFast gateway — Seedance 2.5 / 2.0 / Fast / Mini / Ultra video, plus the `asset://` library and real-human verification |
 | `MODAL_LTX2_ENDPOINT_URL` | ltx_video_modal | Self-hosted LTX-2 |
 | `VIDEO_GEN_LOCAL_ENABLED` | local video tools | Enable local GPU generation |
 | `VIDEO_GEN_LOCAL_MODEL` | wan, hunyuan, ltx, cogvideo | Select local model |
