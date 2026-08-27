@@ -48,14 +48,44 @@ R2_KEY_PREFIX=openmontage
 registry.get("r2_storage").execute({
     "operation": "upload",
     "path": "projects/<slug>/references/portrait.jpg",
-    "folder": "juanda",            # <prefix>/<folder>/<file>
+    "project": "<slug>",           # <prefix>/<project>/<kind>/<file>
+    "kind": "faces",               # faces | refs | video | audio
 })
-# -> {"key": "openmontage/juanda/portrait-8f21a0c3.jpg",
-#     "url": "https://pub-<hash>.r2.dev/openmontage/juanda/portrait-8f21a0c3.jpg",
-#     "public_verified": true}
+# -> {"key": "openmontage/<slug>/faces/portrait-8f21a0c3.jpg",
+#     "url": "https://pub-<hash>.r2.dev/openmontage/<slug>/faces/portrait-8f21a0c3.jpg",
+#     "public_verified": true, "retained": true}
 ```
 
-Operations: `upload`, `upload_many`, `delete`, `exists`, `url`.
+Operations: `upload`, `upload_many`, `delete`, `exists`, `url`, `list`, `sweep`.
+
+## Key layout
+
+    <prefix>/<project>/<kind>/<name>-<random>.<ext>
+
+Project first, so everything for one client is a single prefix and finishing a
+project is one sweep. `kind` under it, so retention can treat a face differently
+from a disposable prop:
+
+| kind | for | retention |
+|------|-----|-----------|
+| `faces` | a person's reference images | **kept** |
+| `refs` | products, locations, props, style boards | swept |
+| `video` / `audio` | reference clips | swept |
+
+## Retention
+
+The provider copies the file into its own storage once its asset is `Active`, so
+the staging object has no further purpose — except for faces, where losing the
+original means re-uploading to re-register the person.
+
+- `anyfast_assets` deletes a transient object automatically after ingestion and
+  keeps `faces`. Override per call with `keep_hosted`.
+- `sweep` cleans up what is left: `{"operation": "sweep", "project": "<slug>",
+  "older_than_days": 7}`. It **defaults to a dry run** — read `candidates`, then
+  repeat with `sweep_dry_run: false`. It skips `faces` unless you pass
+  `include_retained: true`.
+- Deleting an object a provider has not ingested yet breaks that generation.
+  When in doubt, sweep by age rather than immediately.
 
 ## Rules that matter
 
@@ -72,6 +102,13 @@ Operations: `upload`, `upload_many`, `delete`, `exists`, `url`.
 - **Clean up.** Treat the bucket as staging. `delete` with the returned `key`
   once the provider has ingested the asset and the generation is done.
 
+## Every provider uses this
+
+`video_selector` and the fal.ai-backed tools call `upload_reference_media()`,
+which prefers R2 whenever it is configured and falls back to fal.ai storage
+otherwise. One hosting story, one bucket to sweep, and no dependency on a fal.ai
+key just to hand a provider a reference image.
+
 ## Related
 
-- `anyfast-assets` — the consumer of these URLs (asset library, real-human faces)
+- `anyfast-assets` — the consumer of these URLs (asset library, faces)

@@ -396,10 +396,12 @@ def test_video_selector_routes_reference_image_to_minimax_h3(monkeypatch, tmp_pa
 
     monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
     monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    # Reference hosting now goes through upload_reference_media (R2 when configured,
+    # fal.ai otherwise); patch the entry point rather than the fal.ai backend.
     monkeypatch.setattr(
         _shared,
-        "upload_image_fal",
-        lambda _path: "https://cdn.example/reference.png",
+        "upload_reference_media",
+        lambda _path, **_kwargs: "https://cdn.example/reference.png",
     )
     calls = {}
 

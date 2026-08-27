@@ -63,15 +63,26 @@ class TestContract:
 
 
 class TestKeys:
-    def test_keys_are_prefixed_foldered_and_unique(self, r2_env):
-        key = r2_client.build_key("PXL_20260825 Photo.RAW-01.jpg", folder="juanda")
-        assert key.startswith("openmontage/juanda/")
+    def test_layout_is_prefix_project_kind_file(self, r2_env):
+        key = r2_client.build_key(
+            "PXL_20260825 Photo.RAW-01.jpg", project="Roman Pinsa", kind="faces"
+        )
+        assert key.startswith("openmontage/roman-pinsa/faces/")
         assert key.endswith(".jpg")
         assert " " not in key and key.islower()
 
     def test_uniqueness_can_be_disabled(self, r2_env):
-        key = r2_client.build_key("portrait.jpg", folder="juanda", unique=False)
-        assert key == "openmontage/juanda/portrait.jpg"
+        key = r2_client.build_key("portrait.jpg", project="p", kind="refs", unique=False)
+        assert key == "openmontage/p/refs/portrait.jpg"
+
+    def test_prefix_for_sweeping(self, r2_env):
+        assert r2_client.key_prefix_for("p", "refs") == "openmontage/p/refs/"
+        assert r2_client.key_prefix_for("p") == "openmontage/p/"
+
+    def test_only_faces_are_retained(self, r2_env):
+        assert r2_client.is_retained("openmontage/p/faces/a.jpg") is True
+        assert r2_client.is_retained("openmontage/p/refs/a.jpg") is False
+        assert r2_client.is_retained("openmontage/p/video/a.mp4") is False
 
     def test_two_uploads_of_one_filename_do_not_collide(self, r2_env):
         first = r2_client.build_key("portrait.jpg")
@@ -127,8 +138,9 @@ class TestUpload:
         monkeypatch.setattr("requests.put", fake_put)
         monkeypatch.setattr("requests.head", lambda url, **kwargs: _FakeResponse(200))
 
-        result = r2_client.upload_file(source, folder="juanda")
-        assert result["url"].startswith("https://pub-abc123.r2.dev/openmontage/juanda/portrait-")
+        result = r2_client.upload_file(source, project="proj", kind="faces")
+        assert result["url"].startswith("https://pub-abc123.r2.dev/openmontage/proj/faces/portrait-")
+        assert result["retained"] is True
         assert result["public_verified"] is True
         assert result["content_type"] == "image/jpeg"
         assert seen["data"] == b"jpeg-bytes"
@@ -209,3 +221,116 @@ class TestToolSurface:
         registry.ensure_discovered()
         names = [t.name for t in registry.get_by_capability("media_hosting")]
         assert "r2_storage" in names
+
+
+class TestListingAndSweep:
+    def _listing(self, keys, truncated=False):
+        items = "".join(
+            f"<Contents><Key>{k}</Key><Size>10</Size>"
+            f"<LastModified>2020-01-01T00:00:00.000Z</LastModified></Contents>"
+            for k in keys
+        )
+        return (
+            '<?xml version="1.0"?><ListBucketResult '
+            'xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            f"<IsTruncated>{'true' if truncated else 'false'}</IsTruncated>{items}"
+            "</ListBucketResult>"
+        )
+
+    def test_query_string_is_part_of_the_signature(self, r2_env):
+        config = r2_client.get_config()
+        url, signed = r2_client.signed_headers(
+            "GET", config=config, key="", query={"list-type": "2", "prefix": "openmontage/"}
+        )
+        assert url.endswith("?list-type=2&prefix=openmontage%2F")
+        _, other = r2_client.signed_headers(
+            "GET", config=config, key="", query={"list-type": "2", "prefix": "different/"}
+        )
+        assert signed["Authorization"] != other["Authorization"]
+
+    def test_list_objects_parses_the_xml(self, r2_env, monkeypatch):
+        class _R:
+            status_code = 200
+            text = self._listing(["openmontage/p/faces/a.jpg", "openmontage/p/refs/b.png"])
+
+        monkeypatch.setattr("requests.get", lambda url, **kwargs: _R())
+        objects = r2_client.list_objects("openmontage/p/")
+        assert [o["key"] for o in objects] == [
+            "openmontage/p/faces/a.jpg",
+            "openmontage/p/refs/b.png",
+        ]
+        assert objects[0]["retained"] is True
+        assert objects[1]["url"].startswith("https://pub-abc123.r2.dev/")
+
+    def test_sweep_skips_faces_and_defaults_to_dry_run(self, r2_env, monkeypatch):
+        class _R:
+            status_code = 200
+            text = self._listing(["openmontage/p/faces/a.jpg", "openmontage/p/refs/b.png"])
+
+        deleted: list[str] = []
+        monkeypatch.setattr("requests.get", lambda url, **kwargs: _R())
+        monkeypatch.setattr(
+            "requests.delete", lambda url, **kwargs: deleted.append(url) or _FakeResponse(204)
+        )
+
+        report = r2_client.sweep(project="p", older_than_days=0)
+        assert report["candidates"] == ["openmontage/p/refs/b.png"]
+        assert report["dry_run"] is True
+        assert deleted == [], "a dry run must not delete"
+
+        report = r2_client.sweep(project="p", older_than_days=0, dry_run=False)
+        assert report["deleted"] == ["openmontage/p/refs/b.png"]
+        assert len(deleted) == 1
+
+    def test_sweep_can_include_faces_explicitly(self, r2_env, monkeypatch):
+        class _R:
+            status_code = 200
+            text = self._listing(["openmontage/p/faces/a.jpg"])
+
+        monkeypatch.setattr("requests.get", lambda url, **kwargs: _R())
+        report = r2_client.sweep(project="p", older_than_days=0, include_retained=True)
+        assert report["candidates"] == ["openmontage/p/faces/a.jpg"]
+
+    def test_recent_objects_survive_an_age_sweep(self, r2_env, monkeypatch):
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+        class _R:
+            status_code = 200
+            text = (
+                '<?xml version="1.0"?><ListBucketResult '
+                'xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated>'
+                f"<Contents><Key>openmontage/p/refs/new.png</Key><Size>10</Size>"
+                f"<LastModified>{now}</LastModified></Contents></ListBucketResult>"
+            )
+
+        monkeypatch.setattr("requests.get", lambda url, **kwargs: _R())
+        assert r2_client.sweep(project="p", older_than_days=7)["candidates"] == []
+
+
+class TestReferenceRouting:
+    def test_reference_media_prefers_r2_over_fal(self, r2_env, monkeypatch, tmp_path):
+        from tools.video import _shared
+
+        source = tmp_path / "ref.png"
+        source.write_bytes(b"x")
+        monkeypatch.setattr("requests.put", lambda url, **kwargs: _FakeResponse(200))
+        monkeypatch.setattr("requests.head", lambda url, **kwargs: _FakeResponse(200))
+        monkeypatch.setattr(
+            _shared, "upload_image_fal", lambda p: pytest.fail("fal must not be used when R2 is on")
+        )
+
+        url = _shared.upload_reference_media(str(source), project="proj")
+        assert url.startswith("https://pub-abc123.r2.dev/openmontage/proj/refs/")
+
+    def test_falls_back_to_fal_without_r2(self, monkeypatch, tmp_path):
+        from tools.video import _shared
+
+        for name in r2_client.REQUIRED_ENV:
+            monkeypatch.delenv(name, raising=False)
+        source = tmp_path / "ref.png"
+        source.write_bytes(b"x")
+        monkeypatch.setattr(_shared, "upload_image_fal", lambda p: "https://fal.example/ref.png")
+        assert _shared.upload_reference_media(str(source)) == "https://fal.example/ref.png"
+

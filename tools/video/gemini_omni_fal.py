@@ -125,7 +125,8 @@ class GeminiOmniFalVideo(BaseTool):
                 success=False, error="FAL_KEY not set. " + self.install_instructions
             )
         import requests
-        from tools.video._shared import probe_output, upload_image_fal
+        from tools.video._shared import probe_output
+        from tools.video._shared import upload_reference_media as upload_image_fal
 
         operation = inputs.get("operation", "text_to_video")
         urls = list(inputs.get("reference_image_urls") or [])

@@ -368,14 +368,18 @@ Verification requires an API token created with the **Byteplus-Direct** group; a
 
 Reference it as a content item — `{"type": "image_url", "image_url": {"url": "asset://<ID>"}, "role": "reference_image"}`. Through `anyfast_video`, pass `asset://<ID>` anywhere a reference URL is accepted.
 
-**Which model reads a verified face** (tested 2026-08-26):
+**A face must be an asset — but usually not a *verified* one** (tested 2026-08-26):
 
-| Model | AIGC `asset://` | LivenessFace `asset://` |
-|-------|-----------------|-------------------------|
-| `seedance-2.5`, `seedance-2.5-nsfw` | works | `InvalidParameter: ... is not found` |
-| `seedance-2.0`, `seedance-2.0-nsfw`, Fast / Mini / Ultra | works | works |
+| Group type | `seedance-2.5` | `seedance-2.0` family |
+|------------|----------------|------------------------|
+| **AIGC** (ordinary) | works | works |
+| **LivenessFace** (verified) | `InvalidParameter: ... is not found` | works |
 
-Seedance 2.5 does not resolve real-human assets, in either the `reference_image` or `first_frame` role, even though `GetAsset` reports them `Active`; the 2.0 family resolves the same asset IDs. **A real person's face therefore means Seedance 2.0.** Passing that face as a plain public URL instead is refused with `InputImageSensitiveContentDetected.PrivacyInformation`, so the verified asset is the only route. `anyfast_video` raises a `dry_run` warning when an `asset://` reference is paired with a 2.5 model, and `model_catalog[model]["resolves_real_human_assets"]` exposes the flag.
+Upload a face to an ordinary AIGC group and it generates on every Seedance model — confirmed by uploading a real portrait with no verification and rendering it on 2.5. Verification is the fallback for images AnyFast refuses, and it costs you 2.5 (4–15s shots instead of 4–30s, 9/3/3 reference items instead of 30/10/10).
+
+What is *not* optional: a face sent as a plain URL or Base64 is refused with `InputImageSensitiveContentDetected.PrivacyInformation`. Faces go through the asset library; ordinary reference images (products, locations, props) do not need one and are inlined as Base64.
+
+`people_registry` remembers who is uploaded, in which group, and therefore which models can use them — `references person=<slug> model=<model>` returns only what will actually resolve.
 
 #### `anyfast_assets` — the asset library
 
@@ -436,7 +440,11 @@ No SDK is required — the tool signs S3 requests (SigV4) directly, so nothing n
 | `exists` / `url` | Check or rebuild the public URL for a key |
 | `delete` | Remove an object permanently |
 
-Keys are `<prefix>/<folder>/<name>-<random>.<ext>`. **Uniqueness is on by default** — overwriting a key a provider already fetched silently changes what it ingested, and AnyFast rejects a second asset that reuses a name.
+Keys are `<prefix>/<project>/<kind>/<name>-<random>.<ext>` — project first so one client is a single prefix, `kind` (`faces` / `refs` / `video` / `audio`) under it so retention can differ. **Uniqueness is on by default** — overwriting a key a provider already fetched silently changes what it ingested, and AnyFast rejects a second asset that reuses a name.
+
+**Retention:** the provider copies the file into its own storage once the asset is `Active`, so `anyfast_assets` deletes transient staging objects automatically and keeps `faces` (re-registering a person otherwise means re-uploading). `sweep` clears the rest — dry run by default, skips `faces` unless `include_retained: true`.
+
+**Everything routes here:** `video_selector` and the fal.ai-backed tools call `upload_reference_media()`, which prefers R2 when configured and falls back to fal.ai storage.
 
 `upload` HEADs the public URL after writing and fails loudly if it is not readable; without that check, a bucket whose public URL is off surfaces much later as an opaque provider-side download error.
 
@@ -1618,6 +1626,7 @@ These tools require only FFmpeg or Python packages — no GPU, no API key.
 | **Volcengine Ark** | `ARK_API_KEY` | `seedance_ark` | Pay-as-you-go |
 | **AnyFast** | `ANYFAST_API_KEY` | `anyfast_video`, `anyfast_assets` | Pay-as-you-go (billed per generation) |
 | **Cloudflare R2** | `R2_ACCOUNT_ID` + `R2_ACCESS_KEY_ID` + `R2_SECRET_ACCESS_KEY` + `R2_BUCKET` + `R2_PUBLIC_BASE_URL` | `r2_storage` | Storage only, no egress fees |
+| **Local registry** | — (no key) | `people_registry` | Free; per-project SQLite outside the repo |
 | **MiniMax direct** | `MINIMAX_API_KEY` | `minimax_image`, `minimax_video` | Pay-as-you-go |
 | **OpenAI** | `OPENAI_API_KEY` | `openai_tts`, `openai_image` | Paid only |
 | **xAI** | `XAI_API_KEY` | `grok_image`, `grok_video` | Paid only |

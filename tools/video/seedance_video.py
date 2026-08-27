@@ -279,7 +279,7 @@ class SeedanceVideo(BaseTool):
             if inputs.get("image_url"):
                 payload["image_url"] = inputs["image_url"]
             elif inputs.get("image_path"):
-                from tools.video._shared import upload_image_fal
+                from tools.video._shared import upload_reference_media as upload_image_fal
 
                 payload["image_url"] = upload_image_fal(inputs["image_path"])
             if inputs.get("end_image_url"):
@@ -290,7 +290,7 @@ class SeedanceVideo(BaseTool):
         if operation == "reference_to_video":
             ref_image_urls = list(inputs.get("reference_image_urls") or [])
             for local_path in inputs.get("reference_image_paths") or []:
-                from tools.video._shared import upload_image_fal
+                from tools.video._shared import upload_reference_media as upload_image_fal
 
                 ref_image_urls.append(upload_image_fal(local_path))
             max_images = 30 if model_version == "2.5" else 9

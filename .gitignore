@@ -105,3 +105,10 @@ venv/
 # Local Wan / diffusers GPU environment
 .venv-wan/
 inputs/
+
+# Local people/face-reference registry (identifiers, never images).
+# It normally lives outside the repo (~/.openmontage/); this is a guard for
+# OPENMONTAGE_PEOPLE_DB pointing somewhere inside a checkout.
+people.db
+**/people.db
+.openmontage/

@@ -514,6 +514,28 @@ def poll_heygen(execution_id: str, api_key: str, timeout: int = 600) -> str:
     raise TimeoutError(f"HeyGen execution {execution_id} timed out after {timeout}s")
 
 
+def upload_reference_media(
+    path: str,
+    *,
+    project: str | None = None,
+    kind: str = "refs",
+) -> str:
+    """Host a local reference file publicly and return its URL.
+
+    Prefers Cloudflare R2 when it is configured: one hosting story for every
+    provider, no dependency on a fal.ai key, and the object lands under a
+    project/kind prefix that the sweep understands. Falls back to fal.ai storage,
+    which is what this used to do unconditionally.
+    """
+    from tools.storage import r2_client
+
+    if r2_client.is_configured():
+        return str(
+            r2_client.upload_file(path, project=project, kind=kind, verify_public=True)["url"]
+        )
+    return upload_image_fal(path)
+
+
 def upload_image_fal(image_path: str) -> str:
     """Upload a local image to fal.ai storage and return a public URL."""
     import requests

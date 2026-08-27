@@ -1,13 +1,72 @@
 ---
 name: anyfast-assets
 description: |
-  The AnyFast asset library and real-human (LivenessFace) verification, end to end: verify a person on their phone, host media on R2, register it with CreateAsset, poll to Active, then reference it as asset://<ID> in a Seedance 2.5 generation with the right role. Use whenever a video must feature a real person's face, whenever a LOCAL video is needed as a reference, or whenever an AnyFast asset call returns a confusing 404. Records the API behaviours that contradict the published docs.
+  How to put a person's face (or any reusable reference) into a Seedance video through AnyFast: register the person, upload their face to an AIGC asset group, reference it as asset://<ID>, and fall back to real-person verification only when AnyFast refuses the image. Also covers when a reference does NOT need an asset at all, the people registry that remembers who is already uploaded, the R2 hosting requirement, and the API behaviours that contradict the published docs. Use for any video featuring a real person, any local reference video, or any confusing AnyFast asset 404.
 ---
 
-# AnyFast assets and real-human faces
+# AnyFast assets and face references
 
-Two tools: `anyfast_assets` (the `/volc/asset` library + verification) and
-`anyfast_video` (generation). Both read `ANYFAST_API_KEY`.
+Tools: `anyfast_assets` (the `/volc/asset` library + verification),
+`people_registry` (who is already uploaded), `r2_storage` (hosting),
+`anyfast_video` (generation).
+
+## Rule 0 — Seedance runs on AnyFast
+
+**When `ANYFAST_API_KEY` is set, Seedance 2.0 and 2.5 go through `anyfast_video`.**
+Not fal.ai, not Replicate. They serve the same models, but AnyFast is cheaper and
+is the only route that can reference a registered face — `asset://` does not exist
+on the others, so a fal.ai Seedance call simply cannot put a specific person in the
+shot. `video_selector` pins this automatically; overriding it means telling the
+user which provider you switched to and why.
+
+## Decide what kind of reference you have
+
+| The reference is… | Do this |
+|---|---|
+| **A person's face** | Upload to that person's **AIGC asset group**, reference `asset://<ID>`. Reusable, and works on **every** Seedance model. |
+| **A face AnyFast refuses** (`PrivacyInformation` / sensitive content) | **Stop and ask the user.** Real-person verification is the only route, and it needs them present with a phone. The resulting group restricts generation to **Seedance 2.0**. |
+| **Not a person** — product, location, style, prop | Just pass the local path or URL. It is inlined as Base64; no asset, no group, no bookkeeping. Register it as an asset only if you will reuse it across many runs. |
+| **A local video** | Must become an asset (`asset://`) — AnyFast cannot ingest video any other way. |
+
+The face path is **not** the verification path by default. An ordinary AIGC group
+accepts face images and its assets work on Seedance 2.5; verification is the
+exception, for images AnyFast refuses.
+
+## Face reference flow
+
+```
+1. people_registry list_people        -> offer the user someone already registered
+2. new person?  ask for consent, then anyfast_assets upload with person="<slug>"
+                (creates <slug>-assets as an AIGC group, records everything)
+3. people_registry references person=<slug> model=<model>  -> asset:// refs
+4. anyfast_video with those refs and role reference_image
+```
+
+`anyfast_assets upload` with a `person` does all the bookkeeping: resolves or
+creates the group, hosts the file on R2, registers the asset, and records it in
+the per-project people database. **Never re-upload a face that is already
+registered** — ask the user first, they usually mean the person you already have.
+
+### Consent
+
+Record it once. Pass `consent_confirmed: true` on the first upload for a person,
+after the user has confirmed that person authorized use of their likeness. It is
+timestamped and never cleared, and later runs reuse it silently. Do not generate
+with a face that has no consent record without asking.
+
+### The people registry
+
+Local SQLite, per project, outside the repository
+(`~/.openmontage/projects/<project>/people.db`). It stores names and provider
+identifiers — never images. It exists because a `LivenessFace` GroupId cannot be
+listed back from the API and its `BytedToken` expires: lose it and the person has
+to verify again.
+
+Before generating anything with a person in it, `list_people` and present the
+options, showing which models each person supports:
+
+- someone with an **AIGC** group → any Seedance model
+- someone with only a **LivenessFace** group → Seedance 2.0 only
 
 ## The one rule that explains most failures
 
@@ -20,7 +79,7 @@ ingested from a public R2 URL reached `Active` in seconds. `anyfast_assets`
 therefore publishes local files to R2 automatically; multipart is behind
 `allow_multipart: true` and should not be used.
 
-## Real-human flow (an authorized person's face)
+## Verification flow — only when AnyFast refuses the face
 
 Required: an API token created with the **Byteplus-Direct** group. An AIGC-only
 token returns `GroupType must be one of [AIGC]`.
@@ -95,26 +154,28 @@ ffmpeg -i in.mp4 -t 12 -vf "scale=720:1280:force_original_aspect_ratio=increase,
 
 ## Generating with the asset
 
-> **Model choice decides whether a verified face works. Verified 2026-08-26.**
+> **The GROUP decides which models can read the asset. Verified 2026-08-26.**
 >
-> | Model | AIGC `asset://` | LivenessFace `asset://` |
-> |-------|-----------------|-------------------------|
-> | `seedance-2.5`, `seedance-2.5-nsfw` | works | **`InvalidParameter: ... is not found`** |
-> | `seedance-2.0` and its variants | works | **works** |
+> | Group type | `seedance-2.5` | `seedance-2.0` family |
+> |------------|----------------|------------------------|
+> | **AIGC** (ordinary) | works | works |
+> | **LivenessFace** (verified) | `InvalidParameter: ... is not found` | works |
 >
-> Seedance 2.5 cannot resolve a real-human asset — generation reports it missing
-> even though `GetAsset` returns `Active`. The 2.0 family resolves the same asset
-> ID. **So a real person's face means Seedance 2.0**, and a pipeline that needs
-> both 2.5's 30-second takes and a verified face has to choose.
+> A face in an **AIGC** group generates on 2.5 — tested with a real portrait,
+> uploaded with no verification, rendering correctly at 480p/4s. That is why the
+> AIGC path is the default for faces.
 >
-> There is no way around it with a plain URL either: a real face sent as a public
-> URL is refused with `InputImageSensitiveContentDetected.PrivacyInformation`
-> ("may contain real person"). The verified asset is the only route, and 2.0 is
-> the only model that reads it.
+> A **LivenessFace** asset is invisible to 2.5 (it reports the asset missing even
+> though `GetAsset` says `Active`) and readable by the 2.0 family. So a person who
+> had to go through verification costs you 2.5: 4–15s shots instead of 4–30s, and
+> 9/3/3 reference items instead of 30/10/10.
 >
-> `anyfast_video` warns at `dry_run` when an `asset://` reference meets a 2.5
-> model, and `get_info()["model_catalog"][model]["resolves_real_human_assets"]`
-> exposes the flag for routing.
+> Passing a face as a **plain URL or Base64** is refused outright with
+> `InputImageSensitiveContentDetected.PrivacyInformation`. Faces must be assets.
+>
+> `anyfast_video` warns at `dry_run` when an `asset://` meets a 2.5 model (it
+> cannot tell which group the asset came from — `people_registry references
+> model=seedance-2.5` can, and only returns what will work).
 
 Pass the reference as a content item with a `role`. Seedance 2.5, one endpoint,
 `POST /v1/video/generations`:

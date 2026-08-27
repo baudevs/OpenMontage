@@ -30,6 +30,9 @@ import type { TerminalStep } from "./components/TerminalScene";
 import { ScreenshotScene } from "./components/ScreenshotScene";
 import type { ScreenshotStep } from "./components/ScreenshotScene";
 import { ProviderChip } from "./components/ProviderChip";
+import { PhoneScreenScene } from "./components/PhoneScreenScene";
+import { BrandCard } from "./components/BrandCard";
+import { ScreenCompositeScene } from "./components/ScreenCompositeScene";
 import { resolveAsset } from "./lib/resolveAsset";
 import type { ParticleType } from "./components/ParticleOverlay";
 import { resolveTheme, type ThemeConfig, DEFAULT_THEME } from "./Root";
@@ -268,6 +271,26 @@ interface Cut {
   screenshotSteps?: ScreenshotStep[];
   screenshotSize?: { width: number; height: number };
   cursorStartAt?: [number, number];
+  // Phone screen scene props (type: "phone_screen_scene")
+  headline?: string;
+  accentChip?: string;
+  headlineColor?: string;
+  bezelColor?: string;
+  screenBackgroundColor?: string;
+  muted?: boolean;
+  phoneOrientation?: "landscape" | "portrait";
+  characterSrc?: string;
+  characterSide?: "left" | "right";
+  characterHeightPct?: number;
+  // Brand card props (type: "brand_card") — logo path goes in the shared `source` field
+  variant?: "compliance" | "cta";
+  bodyText?: string;
+  buttonLabel?: string;
+  // Screen composite scene props (type: "screen_composite_scene") — pre-composited
+  // (real ffmpeg chroma-key, not a CSS overlay) video path goes in the shared
+  // `source` field; seek position in the shared `source_in_seconds` field.
+  caption?: string;
+  captionColor?: string;
 }
 
 interface Overlay {
@@ -651,6 +674,50 @@ const SceneRenderer: React.FC<{ cut: Cut; theme: ThemeConfig }> = ({ cut, theme 
         steps={cut.screenshotSteps as ScreenshotStep[]}
         accentColor={accent}
         cursorStartAt={cut.cursorStartAt}
+      />
+    );
+  }
+  if (cut.type === "phone_screen_scene" && cut.source) {
+    return maybeWrapWithBg(
+      <PhoneScreenScene
+        source={cut.source}
+        sourceInSeconds={cut.source_in_seconds ?? 0}
+        muted={cut.muted ?? true}
+        headline={cut.headline}
+        accentChip={cut.accentChip}
+        headlineColor={cut.headlineColor}
+        accentColor={accent}
+        bezelColor={cut.bezelColor}
+        screenBackgroundColor={cut.screenBackgroundColor}
+        canvasBackgroundColor={bgColor}
+        orientation={cut.phoneOrientation as "landscape" | "portrait" | undefined}
+        characterSrc={cut.characterSrc}
+        characterSide={cut.characterSide}
+        characterHeightPct={cut.characterHeightPct}
+      />
+    );
+  }
+  if (cut.type === "screen_composite_scene" && cut.source) {
+    return maybeWrapWithBg(
+      <ScreenCompositeScene
+        source={cut.source}
+        sourceInSeconds={cut.source_in_seconds ?? 0}
+        muted={cut.muted ?? true}
+        caption={cut.caption}
+        captionColor={cut.captionColor}
+      />
+    );
+  }
+  if (cut.type === "brand_card" && cut.source && cut.variant) {
+    return maybeWrapWithBg(
+      <BrandCard
+        logoSrc={cut.source}
+        variant={cut.variant}
+        bodyText={cut.bodyText}
+        headline={cut.text}
+        buttonLabel={cut.buttonLabel}
+        accentColor={accent}
+        backgroundColor={bgColor || theme.backgroundColor}
       />
     );
   }

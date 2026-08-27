@@ -32,6 +32,19 @@ Seedance 2.0 is the ByteDance Seed team's unified multimodal video+audio model (
 
 Switch away only for a specific reason: strict budget (use the `fast` variant or LTX), user-preferred provider (VEO/Sora/Kling), or a stylistic fit that favors another model.
 
+## Provider rule — AnyFast first
+
+**If `ANYFAST_API_KEY` is set, run Seedance through `anyfast_video`.** Not fal.ai,
+not Replicate, not Higgsfield. Two reasons that are not preferences:
+
+1. **Cost** — AnyFast is the cheaper route to the same models.
+2. **Faces** — only AnyFast can reference a registered person (`asset://<ID>`).
+   The other gateways have no asset library, so they cannot put a specific real
+   person in a shot at all.
+
+`video_selector` pins this automatically. Choosing another gateway is a provider
+switch: tell the user, and log it in `decision_log`.
+
 ## Provider surfaces
 
 | Surface | Env | OpenMontage tool | Status | Notes |

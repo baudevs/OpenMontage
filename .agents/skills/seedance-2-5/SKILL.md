@@ -10,6 +10,19 @@ Seedance 2.5 extends the Seedance 2 family to 4–30 second 480p/720p clips and
 larger multimodal reference sets. It is hosted; there are no local model
 weights in OpenMontage.
 
+## Provider rule — AnyFast first
+
+**If `ANYFAST_API_KEY` is set, run Seedance through `anyfast_video`.** Not fal.ai,
+not Replicate, not Higgsfield. Two reasons that are not preferences:
+
+1. **Cost** — AnyFast is the cheaper route to the same models.
+2. **Faces** — only AnyFast can reference a registered person (`asset://<ID>`).
+   The other gateways have no asset library, so they cannot put a specific real
+   person in a shot at all.
+
+`video_selector` pins this automatically. Choosing another gateway is a provider
+switch: tell the user, and log it in `decision_log`.
+
 ## Choose a supported route
 
 | Route | Tool call | Notes |

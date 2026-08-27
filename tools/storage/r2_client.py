@@ -104,14 +104,27 @@ def safe_segment(value: str) -> str:
     return cleaned.strip("-.").lower() or "file"
 
 
+# What an object is for. `faces` is kept after ingestion (re-registering a person
+# means re-uploading); everything else is transient and swept once the provider
+# has copied it.
+KINDS = ("faces", "refs", "video", "audio")
+RETAINED_KINDS = ("faces",)
+
+
 def build_key(
     filename: str,
     *,
     prefix: str | None = None,
+    project: str | None = None,
+    kind: str | None = None,
     folder: str | None = None,
     unique: bool = True,
 ) -> str:
-    """Build an object key.
+    """Build an object key: `<prefix>/<project>/<kind>/<name>-<random>.<ext>`.
+
+    Project first so one client's media is a single prefix — finishing a project
+    is then one sweep — and `kind` under it so retention can treat faces
+    differently from disposable references.
 
     Uniqueness is on by default because overwriting a key that a provider has
     already fetched (or is about to) silently changes what it ingests — and
@@ -125,9 +138,22 @@ def build_key(
     name = safe_segment(stem)
     if unique:
         name = f"{name}-{uuid.uuid4().hex[:8]}"
-    parts = [part.strip("/") for part in (config_prefix, folder) if part and part.strip("/")]
+    segments = [config_prefix, project, kind, folder]
+    parts = [safe_segment(part) for part in segments if part and str(part).strip("/")]
     parts.append(f"{name}{suffix}")
     return "/".join(parts)
+
+
+def key_prefix_for(project: str | None = None, kind: str | None = None) -> str:
+    """The prefix a listing/sweep should target."""
+    config_prefix = os.environ.get("R2_KEY_PREFIX") or DEFAULT_KEY_PREFIX
+    parts = [safe_segment(p) for p in (config_prefix, project, kind) if p and str(p).strip("/")]
+    return "/".join(parts) + "/"
+
+
+def is_retained(key: str) -> bool:
+    """True when a key belongs to a kind we keep after the provider ingests it."""
+    return any(f"/{kind}/" in f"/{key}" for kind in RETAINED_KINDS)
 
 
 # ---- SigV4 ----
@@ -148,14 +174,20 @@ def signed_headers(
     method: str,
     *,
     config: dict[str, str],
-    key: str,
+    key: str = "",
     payload: bytes = b"",
     content_type: str | None = None,
+    query: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Return (url, headers) for an SigV4-signed R2 request."""
     host = config["endpoint"].removeprefix("https://")
-    canonical_uri = "/" + quote(f"{config['bucket']}/{key}", safe="/~")
-    url = f"https://{host}{canonical_uri}"
+    path = f"{config['bucket']}/{key}" if key else config["bucket"]
+    canonical_uri = "/" + quote(path, safe="/~")
+    canonical_query = "&".join(
+        f"{quote(name, safe='~')}={quote(str(value), safe='~')}"
+        for name, value in sorted((query or {}).items())
+    )
+    url = f"https://{host}{canonical_uri}" + (f"?{canonical_query}" if canonical_query else "")
 
     now = datetime.now(timezone.utc)
     amzdate = now.strftime("%Y%m%dT%H%M%SZ")
@@ -173,7 +205,7 @@ def signed_headers(
     signed = ";".join(sorted(headers))
     canonical_headers = "".join(f"{name}:{headers[name]}\n" for name in sorted(headers))
     canonical_request = "\n".join(
-        [method, canonical_uri, "", canonical_headers, signed, payload_hash]
+        [method, canonical_uri, canonical_query, canonical_headers, signed, payload_hash]
     )
     scope = f"{datestamp}/{REGION}/{SERVICE}/aws4_request"
     string_to_sign = "\n".join(
@@ -207,6 +239,8 @@ def public_url(key: str, config: dict[str, str] | None = None) -> str:
 def upload_file(
     path: str | Path,
     *,
+    project: str | None = None,
+    kind: str | None = None,
     folder: str | None = None,
     key: str | None = None,
     unique: bool = True,
@@ -226,7 +260,9 @@ def upload_file(
     source = Path(path).expanduser()
     if not source.is_file():
         raise FileNotFoundError(f"file not found: {source}")
-    object_key = key or build_key(source.name, folder=folder, unique=unique)
+    object_key = key or build_key(
+        source.name, project=project, kind=kind, folder=folder, unique=unique
+    )
     payload = source.read_bytes()
     guessed = content_type or mimetypes.guess_type(source.name)[0] or "application/octet-stream"
 
@@ -251,6 +287,7 @@ def upload_file(
         "size_bytes": len(payload),
         "content_type": guessed,
         "public_verified": False,
+        "retained": is_retained(object_key),
     }
     if verify_public:
         result["public_verified"] = wait_until_public(result["url"])
@@ -300,3 +337,92 @@ def object_exists(key: str) -> bool:
     url, headers = signed_headers("HEAD", config=config, key=key)
     response = requests.head(url, headers=headers, timeout=(CONNECT_TIMEOUT_SECONDS, 30))
     return response.status_code == 200
+
+
+def list_objects(prefix: str = "", *, max_keys: int = 1000) -> list[dict[str, Any]]:
+    """List objects under a prefix (ListObjectsV2, paginated)."""
+    import requests
+    from xml.etree import ElementTree
+
+    config = get_config()
+    namespace = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+    objects: list[dict[str, Any]] = []
+    token: str | None = None
+
+    while True:
+        query = {"list-type": "2", "max-keys": str(max_keys)}
+        if prefix:
+            query["prefix"] = prefix
+        if token:
+            query["continuation-token"] = token
+        url, headers = signed_headers("GET", config=config, key="", query=query)
+        response = requests.get(url, headers=headers, timeout=(CONNECT_TIMEOUT_SECONDS, 120))
+        if response.status_code >= 400:
+            raise RuntimeError(f"R2 list failed ({response.status_code}): {response.text[:300]}")
+        root = ElementTree.fromstring(response.text)
+        for item in root.findall(f"{namespace}Contents"):
+            key = (item.findtext(f"{namespace}Key") or "").strip()
+            if not key:
+                continue
+            objects.append(
+                {
+                    "key": key,
+                    "size_bytes": int(item.findtext(f"{namespace}Size") or 0),
+                    "last_modified": item.findtext(f"{namespace}LastModified"),
+                    "url": public_url(key, config),
+                    "retained": is_retained(key),
+                }
+            )
+        if (root.findtext(f"{namespace}IsTruncated") or "").lower() != "true":
+            return objects
+        token = root.findtext(f"{namespace}NextContinuationToken")
+        if not token:
+            return objects
+
+
+def sweep(
+    *,
+    project: str | None = None,
+    kind: str | None = None,
+    older_than_days: float = 7.0,
+    include_retained: bool = False,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Delete transient objects the provider has already ingested.
+
+    `faces` are skipped unless `include_retained` is set: re-registering a person
+    means re-uploading their source images, so those are worth keeping. Defaults
+    to a dry run — deletion is not reversible.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=float(older_than_days))
+    candidates = []
+    for item in list_objects(key_prefix_for(project, kind)):
+        if item["retained"] and not include_retained:
+            continue
+        stamp = item.get("last_modified")
+        if stamp:
+            try:
+                modified = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            except ValueError:
+                modified = None
+            if modified and modified > cutoff:
+                continue
+        candidates.append(item)
+
+    deleted = []
+    if not dry_run:
+        for item in candidates:
+            delete_object(item["key"])
+            deleted.append(item["key"])
+    return {
+        "prefix": key_prefix_for(project, kind),
+        "older_than_days": older_than_days,
+        "candidates": [item["key"] for item in candidates],
+        "candidate_bytes": sum(item["size_bytes"] for item in candidates),
+        "deleted": deleted,
+        "dry_run": dry_run,
+        "skipped_retained": not include_retained,
+    }
+

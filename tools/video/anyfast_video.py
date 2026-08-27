@@ -286,6 +286,9 @@ class AnyFastVideo(BaseTool):
         "precise pre-flight budgeting without a configured price override",
     ]
     fallback_tools = ["seedance_ark", "seedance_video", "seedance_replicate", "kling_video"]
+    # Same Seedance models as the fal.ai/Replicate routes, so the same output quality;
+    # the scoring engine reads this directly (see lib/scoring.py).
+    quality_score = 0.95
 
     input_schema = {
         "type": "object",

@@ -344,8 +344,12 @@ class VideoSelector(BaseTool):
             # If the provider uses image_url (not reference_image_path), upload and convert
             if "image_url" in tool_props and "image_url" not in adapted:
                 try:
-                    from tools.video._shared import upload_image_fal
-                    adapted["image_url"] = upload_image_fal(adapted["reference_image_path"])
+                    from tools.video._shared import upload_reference_media
+
+                    adapted["image_url"] = upload_reference_media(
+                        adapted["reference_image_path"],
+                        project=self._project_slug(adapted),
+                    )
                 except Exception as e:
                     return ToolResult(success=False, error=f"Failed to upload reference image: {e}")
 
@@ -413,6 +417,11 @@ class VideoSelector(BaseTool):
         def _tool_for(score: object) -> BaseTool | None:
             return selectable_by_name.get(getattr(score, "tool_name", None))
 
+        # Hard rule: Seedance runs on AnyFast whenever ANYFAST_API_KEY is set.
+        pinned = self._pin_seedance_to_anyfast(selectable_by_name, rankings, preferred)
+        if pinned is not None:
+            return pinned
+
         # If a preferred provider is explicitly requested, honor it ONLY when its
         # best ranked tool is within a configurable score gap of the overall top.
         # The prior code returned the preferred provider on the first ranking
@@ -438,6 +447,60 @@ class VideoSelector(BaseTool):
                 return tool, score
 
         return None, None
+
+    # Backends that serve the same Seedance models as anyfast_video.
+    SEEDANCE_BACKENDS = frozenset(
+        {"seedance_video", "seedance_replicate", "seedance_ark", "higgsfield_video"}
+    )
+
+    def _pin_seedance_to_anyfast(
+        self,
+        selectable_by_name: dict[str, BaseTool],
+        rankings: list[object],
+        preferred: object,
+    ) -> tuple[BaseTool, object] | None:
+        """Route Seedance work to AnyFast when its key is configured.
+
+        The gateways serve the same models, but AnyFast is cheaper and is the only
+        one that can reference a registered face (`asset://`), which the fal.ai and
+        Replicate paths cannot do at all. Ranking alone treated them as
+        interchangeable, so this pins the choice rather than leaving it to weights.
+
+        An explicit `preferred_provider` still wins — naming another provider is a
+        deliberate decision, and the selector records it in the result.
+        """
+        anyfast = selectable_by_name.get("anyfast_video")
+        if anyfast is None or preferred not in ("auto", None, "", "anyfast"):
+            return None
+        top = next(
+            (s for s in rankings if selectable_by_name.get(getattr(s, "tool_name", None))),
+            None,
+        )
+        if top is None:
+            return None
+        top_name = getattr(top, "tool_name", "")
+        if top_name == "anyfast_video" or top_name not in self.SEEDANCE_BACKENDS:
+            return None
+        anyfast_score = next(
+            (s for s in rankings if getattr(s, "tool_name", None) == "anyfast_video"), top
+        )
+        return anyfast, anyfast_score
+
+    @staticmethod
+    def _project_slug(inputs: dict[str, object]) -> str | None:
+        """Project segment for hosted reference media, when the brief names one."""
+        from pathlib import Path as _Path
+
+        for key in ("project_dir", "output_path"):
+            value = inputs.get(key)
+            if not value:
+                continue
+            parts = _Path(str(value)).parts
+            if "projects" in parts:
+                index = parts.index("projects")
+                if index + 1 < len(parts):
+                    return parts[index + 1]
+        return None
 
     def _prepare_task_context(self, inputs: dict[str, object]) -> dict[str, object]:
         from lib.scoring import normalize_task_context

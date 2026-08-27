@@ -47,7 +47,7 @@ class R2Storage(BaseTool):
     determinism = Determinism.DETERMINISTIC
     runtime = ToolRuntime.API
 
-    OPERATIONS = ("upload", "upload_many", "delete", "exists", "url")
+    OPERATIONS = ("upload", "upload_many", "delete", "exists", "url", "list", "sweep")
 
     dependencies = [f"env:{name}" for name in r2_client.REQUIRED_ENV]
     install_instructions = (
@@ -60,7 +60,7 @@ class R2Storage(BaseTool):
     )
     agent_skills = ["r2-storage"]
 
-    capabilities = ["upload_media", "public_url", "delete_media", "object_exists"]
+    capabilities = ["upload_media", "public_url", "delete_media", "object_exists", "list_media", "sweep_media"]
     supports = {
         "public_urls": True,
         "images": True,
@@ -90,12 +90,33 @@ class R2Storage(BaseTool):
                 "items": {"type": "string"},
                 "description": "Local files for operation=upload_many.",
             },
+            "project": {
+                "type": "string",
+                "description": "Project slug — the first segment: <prefix>/<project>/<kind>/<file>.",
+            },
+            "kind": {
+                "type": "string",
+                "enum": list(r2_client.KINDS),
+                "description": (
+                    "What the object is for. `faces` is retained after the provider "
+                    "ingests it (re-registering a person means re-uploading); the rest "
+                    "are transient and swept."
+                ),
+            },
             "folder": {
                 "type": "string",
-                "description": (
-                    "Optional folder under the key prefix, e.g. a project slug or a "
-                    "person's name: <prefix>/<folder>/<file>."
-                ),
+                "description": "Optional extra segment under <prefix>/<project>/<kind>/.",
+            },
+            "older_than_days": {"type": "number", "default": 7, "description": "sweep: age threshold."},
+            "include_retained": {
+                "type": "boolean",
+                "default": False,
+                "description": "sweep: also delete `faces`. Off by default.",
+            },
+            "sweep_dry_run": {
+                "type": "boolean",
+                "default": True,
+                "description": "sweep: list what would go without deleting. Deletion is irreversible.",
             },
             "key": {"type": "string", "description": "Exact object key (overrides folder/unique)."},
             "unique": {
@@ -166,6 +187,8 @@ class R2Storage(BaseTool):
                     planned = [
                         r2_client.build_key(
                             Path(str(p)).name,
+                            project=inputs.get("project"),
+                            kind=inputs.get("kind"),
                             folder=inputs.get("folder"),
                             unique=bool(inputs.get("unique", True)),
                         )
@@ -203,6 +226,8 @@ class R2Storage(BaseTool):
         if operation == "upload":
             return r2_client.upload_file(
                 inputs["path"],
+                project=inputs.get("project"),
+                kind=inputs.get("kind"),
                 folder=inputs.get("folder"),
                 key=inputs.get("key"),
                 unique=bool(inputs.get("unique", True)),
@@ -213,6 +238,8 @@ class R2Storage(BaseTool):
             uploaded = [
                 r2_client.upload_file(
                     path,
+                    project=inputs.get("project"),
+                    kind=inputs.get("kind"),
                     folder=inputs.get("folder"),
                     unique=bool(inputs.get("unique", True)),
                     content_type=inputs.get("content_type"),
@@ -229,6 +256,23 @@ class R2Storage(BaseTool):
         if operation == "url":
             key = str(inputs["key"])
             return {"key": key, "url": r2_client.public_url(key)}
+        if operation == "list":
+            objects = r2_client.list_objects(
+                r2_client.key_prefix_for(inputs.get("project"), inputs.get("kind"))
+            )
+            return {
+                "objects": objects,
+                "count": len(objects),
+                "total_bytes": sum(o["size_bytes"] for o in objects),
+            }
+        if operation == "sweep":
+            return r2_client.sweep(
+                project=inputs.get("project"),
+                kind=inputs.get("kind"),
+                older_than_days=float(inputs.get("older_than_days", 7)),
+                include_retained=bool(inputs.get("include_retained", False)),
+                dry_run=bool(inputs.get("sweep_dry_run", True)),
+            )
         raise ValueError(f"unsupported operation: {operation}")
 
     @staticmethod

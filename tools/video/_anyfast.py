@@ -419,6 +419,9 @@ def create_asset(
     group_type: str | None = None,
     allow_multipart: bool = False,
     hosting_folder: str | None = None,
+    hosting_project: str | None = None,
+    hosting_kind: str | None = None,
+    hosted: list[dict[str, Any]] | None = None,
 ) -> str:
     """Register one asset from a URL, a data URI, or a local file.
 
@@ -462,7 +465,13 @@ def create_asset(
             if not asset_id:
                 raise RuntimeError("AnyFast CreateAsset returned no Id")
             return str(asset_id)
-        source = host_locally_for_ingestion(path, folder=hosting_folder)
+        source = host_locally_for_ingestion(
+            path,
+            folder=hosting_folder,
+            project=hosting_project,
+            kind=hosting_kind,
+            hosted=hosted,
+        )
 
     response = requests.post(
         url,
@@ -483,8 +492,19 @@ def create_asset(
     return str(asset_id)
 
 
-def host_locally_for_ingestion(path: Path, *, folder: str | None = None) -> str:
-    """Publish a local file to R2 and return the public URL AnyFast will fetch."""
+def host_locally_for_ingestion(
+    path: Path,
+    *,
+    folder: str | None = None,
+    project: str | None = None,
+    kind: str | None = None,
+    hosted: list[dict[str, Any]] | None = None,
+) -> str:
+    """Publish a local file to R2 and return the public URL AnyFast will fetch.
+
+    Appends the upload record to `hosted` so the caller can sweep a transient
+    object once the provider has copied it.
+    """
     from tools.storage import r2_client
 
     if not r2_client.is_configured():
@@ -495,7 +515,11 @@ def host_locally_for_ingestion(path: Path, *, folder: str | None = None) -> str:
             "pass allow_multipart=true to use AnyFast's multipart upload — which returned "
             "unusable assets in testing."
         )
-    uploaded = r2_client.upload_file(path, folder=folder, unique=True, verify_public=True)
+    uploaded = r2_client.upload_file(
+        path, project=project, kind=kind, folder=folder, unique=True, verify_public=True
+    )
+    if hosted is not None:
+        hosted.append(uploaded)
     return str(uploaded["url"])
 
 
@@ -506,6 +530,26 @@ def get_asset(api_key: str, asset_id: str) -> dict[str, Any]:
 def is_unresolvable(exc: Exception) -> bool:
     """True for the poll error raised when no read path resolves the asset."""
     return "cannot resolve asset" in str(exc)
+
+
+FACE_REJECTION_MARKERS = (
+    "PrivacyInformation",
+    "may contain real person",
+    "SensitiveContentDetected",
+    "FaceMismatch",
+    "Face consistency verification failed",
+)
+
+
+def is_face_rejection(exc: Exception | str) -> bool:
+    """True when the provider refused the media because it shows a real person.
+
+    An ordinary AIGC group accepts most face images, so this is the exception
+    rather than the rule — but when it fires, the only route is a verified
+    (LivenessFace) group, which restricts generation to Seedance 2.0.
+    """
+    message = str(exc)
+    return any(marker in message for marker in FACE_REJECTION_MARKERS)
 
 
 def is_not_found(exc: Exception) -> bool:
@@ -620,6 +664,9 @@ def upload_asset(
     unique_name: bool = True,
     allow_multipart: bool = False,
     hosting_folder: str | None = None,
+    hosting_project: str | None = None,
+    hosting_kind: str | None = None,
+    keep_hosted: bool | None = None,
 ) -> dict[str, Any]:
     """Group -> CreateAsset -> poll to Active -> a usable `asset://` reference.
 
@@ -655,6 +702,7 @@ def upload_asset(
         # A duplicate Name inside a group makes CreateAsset/GetAsset answer 404 as if
         # the group did not exist — a confusing failure that costs a paid create.
         name = f"{name}-{uuid.uuid4().hex[:6]}"
+    hosted: list[dict[str, Any]] = []
     asset_id = create_asset(
         api_key,
         group_id=group_id,
@@ -664,6 +712,9 @@ def upload_asset(
         group_type=group_type,
         allow_multipart=allow_multipart,
         hosting_folder=hosting_folder,
+        hosting_project=hosting_project,
+        hosting_kind=hosting_kind,
+        hosted=hosted,
     )
     asset = poll_asset(
         api_key,
@@ -690,7 +741,7 @@ def upload_asset(
             + " and cannot be used."
             + hint
         )
-    return {
+    result = {
         "asset_id": asset_id,
         "asset_ref": f"asset://{asset_id}",
         "group_id": group_id,
@@ -702,6 +753,22 @@ def upload_asset(
         "name": asset.get("Name", name),
         "read_via": asset.get("_read_via", "GetAsset"),
     }
+    if hosted:
+        result["hosted"] = hosted
+        # The provider has copied the file into its own storage, so a transient
+        # staging object has no reason to stay public. Face sources are kept:
+        # re-registering a person otherwise means re-uploading the originals.
+        keep = keep_hosted if keep_hosted is not None else any(h.get("retained") for h in hosted)
+        result["hosted_kept"] = bool(keep)
+        if not keep:
+            from tools.storage import r2_client
+
+            for entry in hosted:
+                try:
+                    r2_client.delete_object(entry["key"])
+                except Exception:  # cleanup is best-effort; sweep() catches leftovers
+                    result["hosted_kept"] = True
+    return result
 
 
 def describe_group(api_key: str, group_id: str) -> dict[str, Any] | None:

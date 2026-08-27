@@ -321,3 +321,56 @@ def test_ark_local_reference_routes_without_fal_upload(rankings, monkeypatch, tm
     assert "image_url" not in ark.last_execute_inputs
     assert result.data["selected_tool"] == "seedance_ark"
     assert result.data["selected_provider"] == "ark"
+
+
+class TestAnyFastSeedancePin:
+    """AnyFast is the mandatory Seedance route when its key is configured.
+
+    The gateways serve the same models, but AnyFast is cheaper and is the only
+    one that can reference a registered face (asset://). Ranking treated them as
+    interchangeable, so the choice is pinned rather than weighted.
+    """
+
+    def _selector_with(self, monkeypatch, tools):
+        sel = VideoSelector()
+        monkeypatch.setattr(sel, "_providers", lambda: tools)
+        return sel
+
+    def test_anyfast_wins_over_fal_on_auto(self, monkeypatch):
+        monkeypatch.setenv("ANYFAST_API_KEY", "fake")
+        from tools.tool_registry import registry
+
+        registry.ensure_discovered()
+        sel = VideoSelector()
+        inputs = {"prompt": "cinematic city flythrough"}
+        tool, _ = sel._select_best_tool(
+            inputs, sel._providers(), sel._prepare_task_context(inputs)
+        )
+        assert tool is not None
+        assert tool.name == "anyfast_video"
+
+    def test_an_explicit_preference_still_wins(self, monkeypatch):
+        monkeypatch.setenv("ANYFAST_API_KEY", "fake")
+        from tools.tool_registry import registry
+
+        registry.ensure_discovered()
+        sel = VideoSelector()
+        inputs = {"prompt": "x", "preferred_provider": "seedance"}
+        tool, _ = sel._select_best_tool(
+            inputs, sel._providers(), sel._prepare_task_context(inputs)
+        )
+        assert tool is not None
+        assert tool.name != "anyfast_video", "a deliberate override must be honored"
+
+    def test_without_the_key_fal_is_used(self, monkeypatch):
+        monkeypatch.delenv("ANYFAST_API_KEY", raising=False)
+        from tools.tool_registry import registry
+
+        registry.ensure_discovered()
+        sel = VideoSelector()
+        inputs = {"prompt": "x"}
+        tool, _ = sel._select_best_tool(
+            inputs, sel._providers(), sel._prepare_task_context(inputs)
+        )
+        assert tool is None or tool.name != "anyfast_video"
+

@@ -92,7 +92,10 @@ def test_theme_text_color_is_threaded_into_overlay_components(component: str) ->
     [
         ("components/SectionTitle.tsx", "color: textColor,"),
         ("components/StatReveal.tsx", "color: textColor,"),
-        ("components/HeroTitle.tsx", "color: i < 8 ? accentColor : textColor,"),
+        # The accent cutoff is free to change (it became `i < firstWordEnd` when the
+        # hard-coded 8 was replaced); what this pins is that BOTH colors come from
+        # props rather than literals.
+        ("components/HeroTitle.tsx", "? accentColor : textColor,"),
         ("components/HeroTitle.tsx", "color: subtitleColor,"),
         ("components/HeroTitle.tsx", "backgroundColor: accentColor,"),
         ("components/HeroTitle.tsx", "background: scrimBackground,"),

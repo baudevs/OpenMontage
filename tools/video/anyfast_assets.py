@@ -54,6 +54,7 @@ from tools.base_tool import (
     ToolStatus,
     ToolTier,
 )
+from lib import people_registry as _people
 from tools.video import _anyfast
 
 
@@ -164,6 +165,25 @@ class AnyFastAssets(BaseTool):
                 "description": "Filter (list) or intent guard (upload). LivenessFace = real-human.",
             },
             "group_ids": {"type": "array", "items": {"type": "string"}},
+            "person": {
+                "type": "string",
+                "description": (
+                    "Person slug for a FACE reference. The upload is routed to that "
+                    "person's asset group (created as AIGC if they have none) and the "
+                    "result is recorded in people_registry so it can be reused. Only for "
+                    "faces — ordinary reference images do not need a person."
+                ),
+            },
+            "project_dir": {
+                "type": "string",
+                "description": "Scopes the people database; each project keeps its own.",
+            },
+            "display_name": {"type": "string", "description": "Human name for a new person."},
+            "consent_confirmed": {
+                "type": "boolean",
+                "default": False,
+                "description": "Record that the user confirmed this person authorized use of their likeness.",
+            },
             "page_number": {"type": "integer", "minimum": 1, "default": 1},
             "page_size": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10},
             "callback_url": {
@@ -194,6 +214,14 @@ class AnyFastAssets(BaseTool):
             "hosting_folder": {
                 "type": "string",
                 "description": "R2 folder for a local source, e.g. a person or project slug.",
+            },
+            "keep_hosted": {
+                "type": "boolean",
+                "description": (
+                    "Override retention of the R2 staging object. Faces are kept by "
+                    "default (re-registering needs the original); other kinds are deleted "
+                    "once the provider has ingested them."
+                ),
             },
             "allow_multipart": {
                 "type": "boolean",
@@ -331,19 +359,53 @@ class AnyFastAssets(BaseTool):
     def _dispatch(self, operation: str, inputs: dict[str, Any], api_key: str) -> dict[str, Any]:
         if operation == "upload":
             source = str(inputs["source"])
-            return _anyfast.upload_asset(
-                api_key,
-                source=source,
-                asset_kind=str(inputs.get("asset_type", "Image")),
-                name=str(inputs.get("name") or Path(source).stem or "openmontage-asset"),
-                group_id=inputs.get("group_id"),
-                group_type=inputs.get("group_type"),
-                timeout=float(inputs.get("timeout_seconds", 300)),
-                poll_interval=float(inputs.get("poll_interval_seconds", 3)),
-                unique_name=bool(inputs.get("unique_name", True)),
-                allow_multipart=bool(inputs.get("allow_multipart", False)),
-                hosting_folder=inputs.get("hosting_folder"),
-            )
+            person = inputs.get("person")
+            group_id = inputs.get("group_id")
+            group_type = inputs.get("group_type")
+            registry_note = None
+
+            if person and not group_id:
+                group_id, group_type, registry_note = self._group_for_person(inputs, api_key)
+
+            try:
+                result = _anyfast.upload_asset(
+                    api_key,
+                    source=source,
+                    asset_kind=str(inputs.get("asset_type", "Image")),
+                    name=str(inputs.get("name") or Path(source).stem or "openmontage-asset"),
+                    group_id=group_id,
+                    group_type=group_type,
+                    timeout=float(inputs.get("timeout_seconds", 300)),
+                    poll_interval=float(inputs.get("poll_interval_seconds", 3)),
+                    unique_name=bool(inputs.get("unique_name", True)),
+                    allow_multipart=bool(inputs.get("allow_multipart", False)),
+                    hosting_folder=inputs.get("hosting_folder") or (person or None),
+                    hosting_project=self._project_slug(inputs),
+                    hosting_kind=self._hosting_kind(inputs),
+                    keep_hosted=inputs.get("keep_hosted"),
+                )
+            except Exception as exc:
+                if _anyfast.is_face_rejection(exc) and str(group_type or "AIGC") == "AIGC":
+                    raise RuntimeError(
+                        f"{_anyfast.safe_error(exc, api_key)}\n"
+                        "  This face was refused by an ordinary AIGC group, so it needs a "
+                        "VERIFIED group. That requires the person to be present with a "
+                        "phone. STOP and ask the user before starting verification, then: "
+                        "create_liveness_session -> they complete it -> get_liveness_result "
+                        "-> upload with that group_id. Generation is then limited to "
+                        "Seedance 2.0 — 2.5 cannot read LivenessFace assets."
+                    ) from exc
+                raise
+
+            if person:
+                result["person"] = str(person)
+                result["registry"] = self._record_upload(inputs, result)
+                if registry_note:
+                    result["registry_note"] = registry_note
+                result["usable_models"] = _people.usable_models(
+                    str(result.get("group_type") or "AIGC")
+                )
+            return result
 
         if operation == "create_asset":
             source = str(inputs["source"])
@@ -359,6 +421,8 @@ class AnyFastAssets(BaseTool):
                 group_type=inputs.get("group_type"),
                 allow_multipart=bool(inputs.get("allow_multipart", False)),
                 hosting_folder=inputs.get("hosting_folder"),
+                hosting_project=self._project_slug(inputs),
+                hosting_kind=self._hosting_kind(inputs),
             )
             return {
                 "asset_id": asset_id,
@@ -460,6 +524,16 @@ class AnyFastAssets(BaseTool):
         if operation == "get_liveness_result":
             result = _anyfast.get_liveness_result(api_key, str(inputs["byted_token"]))
             group_id = str(result.get("GroupId") or "")
+            if group_id and inputs.get("person"):
+                with _people.connect(inputs.get("project_dir")) as connection:
+                    _people.record_group(
+                        connection,
+                        person_slug=str(inputs["person"]),
+                        group_id=group_id,
+                        group_type="LivenessFace",
+                        name=inputs.get("group_name"),
+                        byted_token=str(inputs["byted_token"]),
+                    )
             return {
                 "group_id": group_id,
                 "verified": bool(group_id),
@@ -473,6 +547,79 @@ class AnyFastAssets(BaseTool):
             }
 
         raise ValueError(f"unsupported operation: {operation}")
+
+    @staticmethod
+    def _project_slug(inputs: dict[str, Any]) -> str | None:
+        project_dir = inputs.get("project_dir")
+        return Path(str(project_dir)).name if project_dir else None
+
+    @staticmethod
+    def _hosting_kind(inputs: dict[str, Any]) -> str:
+        """`faces` when the upload belongs to a person, else by media type.
+
+        The distinction drives retention: a face source is kept because
+        re-registering that person means re-uploading it, while a one-shot
+        reference is swept once the provider has copied it.
+        """
+        if inputs.get("person"):
+            return "faces"
+        return {"Video": "video", "Audio": "audio"}.get(
+            str(inputs.get("asset_type", "Image")), "refs"
+        )
+
+    # ---- person routing ----
+
+    def _group_for_person(
+        self, inputs: dict[str, Any], api_key: str
+    ) -> tuple[str, str, str | None]:
+        """Find or create the asset group a person's face references belong in.
+
+        AIGC is preferred: its assets are readable by every Seedance model, while
+        a LivenessFace group restricts generation to the 2.0 family.
+        """
+        person = str(inputs["person"])
+        with _people.connect(inputs.get("project_dir")) as connection:
+            _people.upsert_person(
+                connection,
+                slug=person,
+                display_name=inputs.get("display_name"),
+                consent_confirmed=bool(inputs.get("consent_confirmed", False)),
+            )
+            existing = _people.resolve_upload_group(connection, person)
+            if existing:
+                return existing["group_id"], existing["group_type"], (
+                    f"reusing {existing['group_type']} group {existing['group_id']}"
+                )
+            slug = _people.slugify(person)
+            group_id = _anyfast.create_asset_group(api_key, f"{slug}-assets", "Image")
+            _people.record_group(
+                connection,
+                person_slug=person,
+                group_id=group_id,
+                group_type="AIGC",
+                name=f"{slug}-assets",
+            )
+            return group_id, "AIGC", f"created AIGC group {group_id} for {slug}"
+
+    def _record_upload(self, inputs: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+        with _people.connect(inputs.get("project_dir")) as connection:
+            _people.record_group(
+                connection,
+                person_slug=str(inputs["person"]),
+                group_id=str(result["group_id"]),
+                group_type=str(result.get("group_type") or "AIGC"),
+            )
+            asset = _people.record_asset(
+                connection,
+                person_slug=str(inputs["person"]),
+                group_id=str(result["group_id"]),
+                asset_id=str(result["asset_id"]),
+                asset_type=str(result.get("asset_type", "Image")),
+                name=result.get("name"),
+                source=str(inputs.get("source")),
+                status=str(result.get("status")),
+            )
+        return {"recorded": True, "asset": asset}
 
     # ---- helpers ----
 
