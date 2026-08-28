@@ -286,6 +286,8 @@ interface Cut {
   variant?: "compliance" | "cta";
   bodyText?: string;
   buttonLabel?: string;
+  textColor?: string;
+  buttonTextColor?: string;
   // Screen composite scene props (type: "screen_composite_scene") — pre-composited
   // (real ffmpeg chroma-key, not a CSS overlay) video path goes in the shared
   // `source` field; seek position in the shared `source_in_seconds` field.
@@ -718,6 +720,8 @@ const SceneRenderer: React.FC<{ cut: Cut; theme: ThemeConfig }> = ({ cut, theme 
         buttonLabel={cut.buttonLabel}
         accentColor={accent}
         backgroundColor={bgColor || theme.backgroundColor}
+        textColor={cut.textColor}
+        buttonTextColor={cut.buttonTextColor}
       />
     );
   }

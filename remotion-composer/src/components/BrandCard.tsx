@@ -6,7 +6,13 @@ import {
   useCurrentFrame,
   useVideoConfig,
 } from "remotion";
+import { loadFont } from "@remotion/google-fonts/DMSans";
 import { resolveAsset } from "../lib/resolveAsset";
+
+const { fontFamily } = loadFont("normal", {
+  weights: ["500", "700", "800"],
+  subsets: ["latin"],
+});
 
 export type BrandCardProps = {
   logoSrc: string;
@@ -20,6 +26,10 @@ export type BrandCardProps = {
   buttonLabel?: string;
   accentColor?: string;
   backgroundColor?: string;
+  /** Headline/body text color -- default white assumes a dark backgroundColor/backgroundImage. Pass a dark color for a light background. */
+  textColor?: string;
+  /** Button label text color -- default dark assumes a light accentColor. */
+  buttonTextColor?: string;
 };
 
 /**
@@ -34,6 +44,8 @@ export const BrandCard: React.FC<BrandCardProps> = ({
   buttonLabel,
   accentColor = "#FFB347",
   backgroundColor = "#170B10",
+  textColor = "#FFFFFF",
+  buttonTextColor = "#1A1200",
 }) => {
   const frame = useCurrentFrame();
   const { fps, width, height } = useVideoConfig();
@@ -93,8 +105,8 @@ export const BrandCard: React.FC<BrandCardProps> = ({
           >
             <div
               style={{
-                color: "#FFFFFF",
-                fontFamily: "Inter, system-ui, sans-serif",
+                color: textColor,
+                fontFamily,
                 fontWeight: 700,
                 fontSize: width * 0.032,
                 textAlign: "center",
@@ -114,8 +126,8 @@ export const BrandCard: React.FC<BrandCardProps> = ({
                 style={{
                   opacity: bodySpring,
                   transform: `translateY(${interpolate(bodySpring, [0, 1], [14, 0])}px)`,
-                  color: "#FFFFFF",
-                  fontFamily: "Inter, system-ui, sans-serif",
+                  color: textColor,
+                  fontFamily,
                   fontWeight: 800,
                   fontSize: width * 0.058,
                   textAlign: "center",
@@ -132,8 +144,8 @@ export const BrandCard: React.FC<BrandCardProps> = ({
                   opacity: buttonSpring,
                   transform: `scale(${interpolate(buttonSpring, [0, 1], [0.85, 1]) * buttonPulse})`,
                   background: accentColor,
-                  color: "#1A1200",
-                  fontFamily: "Inter, system-ui, sans-serif",
+                  color: buttonTextColor,
+                  fontFamily,
                   fontWeight: 800,
                   fontSize: width * 0.04,
                   padding: `${height * 0.02}px ${width * 0.09}px`,
